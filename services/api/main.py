@@ -15,12 +15,36 @@ create_app() is a factory (rather than a bare module-level `app`)
 so that tests can construct an isolated app instance with different
 settings/dependency overrides instead of importing a singleton that
 already has a real config baked in.
+
+The lifespan context manager owns anything with real connection
+setup/teardown (currently: RabbitMQ). It runs once per process,
+around the whole app's lifetime -- not per-request -- which is the
+same reasoning as persistence/database.py's single module-level
+engine: a connection is expensive to establish and meant to be
+reused, not opened and closed per call.
 """
+
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from config import get_settings
+from messaging.connection import RabbitMQConnection
+from messaging.publisher import TaskPublisher
 from services.api.routers import health
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    rabbitmq = RabbitMQConnection()
+    await rabbitmq.connect()
+    app.state.rabbitmq = rabbitmq
+    app.state.publisher = TaskPublisher(rabbitmq.task_exchange)
+    try:
+        yield
+    finally:
+        await rabbitmq.close()
 
 
 def create_app() -> FastAPI:
@@ -33,6 +57,7 @@ def create_app() -> FastAPI:
             "API gateway for a from-scratch distributed task queue "
             "and job execution platform."
         ),
+        lifespan=lifespan,
     )
 
     app.state.settings = settings
