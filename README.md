@@ -111,14 +111,3 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 ```
-
-## Roadmap
-
-This project is developed in 24 phases, from repository setup through
-security hardening and final documentation. See the commit history for the
-actual order of implementation, and
-[docs/architecture.md](docs/architecture.md) for the plan.
-
-## License
-
-Personal portfolio project.
