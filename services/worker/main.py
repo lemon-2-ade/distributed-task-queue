@@ -43,8 +43,8 @@ import uuid
 from config import get_settings
 from messaging.connection import RabbitMQConnection
 from messaging.publisher import TaskPublisher
-from messaging.queues import QUEUE_BY_PRIORITY
-from services.worker.consumer import make_message_handler
+from messaging.queues import DEAD_LETTER_QUEUE, QUEUE_BY_PRIORITY
+from services.worker.consumer import make_dlq_handler, make_message_handler
 
 WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
 
@@ -68,7 +68,21 @@ async def main() -> None:
         consumer_tag = await queue.consume(handler)
         consumers.append((queue, consumer_tag))
 
-    print(f"[{WORKER_ID}] consuming from {list(QUEUE_BY_PRIORITY.values())}", flush=True)
+    # Every worker also consumes the DLQ (Phase 9) -- there's no
+    # separate "DLQ watcher" process. With multiple worker replicas
+    # (Phase 6), RabbitMQ round-robins dead_letter.queue deliveries
+    # across all of them the same way it does the priority queues;
+    # whichever worker gets a given DLQ message is the one that
+    # marks that task DEAD_LETTERED.
+    dlq_handler = make_dlq_handler()
+    dlq_queue = await channel.get_queue(DEAD_LETTER_QUEUE)
+    dlq_consumer_tag = await dlq_queue.consume(dlq_handler)
+    consumers.append((dlq_queue, dlq_consumer_tag))
+
+    print(
+        f"[{WORKER_ID}] consuming from {list(QUEUE_BY_PRIORITY.values())} and {DEAD_LETTER_QUEUE}",
+        flush=True,
+    )
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

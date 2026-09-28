@@ -30,10 +30,16 @@ VALID_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.FAILED: frozenset({TaskStatus.RETRYING, TaskStatus.DEAD_LETTERED}),
     TaskStatus.TIMEOUT: frozenset({TaskStatus.RETRYING, TaskStatus.DEAD_LETTERED}),
     TaskStatus.RETRYING: frozenset({TaskStatus.QUEUED}),
-    # Terminal states: no outgoing edges.
+    # Terminal for the automatic system -- SUCCESS and CANCELLED have
+    # no outgoing edges at all. DEAD_LETTERED has exactly one: a
+    # human administrator can explicitly requeue a dead-lettered task
+    # (POST /tasks/{id}/retry, Phase 9). That's a deliberate,
+    # single-purpose exception to "terminal means terminal" -- every
+    # other transition in this table is something the system decides
+    # on its own; this one only happens when a person asks for it.
     TaskStatus.SUCCESS: frozenset(),
     TaskStatus.CANCELLED: frozenset(),
-    TaskStatus.DEAD_LETTERED: frozenset(),
+    TaskStatus.DEAD_LETTERED: frozenset({TaskStatus.QUEUED}),
 }
 
 

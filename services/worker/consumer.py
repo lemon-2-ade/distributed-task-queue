@@ -58,7 +58,7 @@ import uuid
 from aio_pika.abc import AbstractIncomingMessage
 
 from config import get_settings
-from domain.exceptions import PermanentTaskError
+from domain.exceptions import InvalidStateTransitionError, PermanentTaskError
 from domain.retry_policy import compute_backoff_seconds
 from domain.states import TaskPriority, TaskStatus
 from messaging.publisher import TaskPublisher
@@ -184,3 +184,59 @@ async def _transition(task_id: uuid.UUID, to_status: TaskStatus, **kwargs: objec
         task = await state_manager.transition(task_id, to_status, **kwargs)
         await session.commit()
         return task
+
+
+def make_dlq_handler():
+    """
+    Consumes dead_letter.queue (Phase 4's topology) and is the only
+    thing that actually marks a task DEAD_LETTERED. Everything before
+    this (Phase 8's retry logic) can only get a message *into* the
+    DLQ by nacking with requeue=False -- nothing upstream of here
+    updates Task.status when that happens, so until this consumer
+    processes the message, a permanently-failed task sits at FAILED,
+    not DEAD_LETTERED. That's a real, brief window of eventual
+    consistency between "RabbitMQ has routed this to the DLQ" and
+    "Postgres reflects that" -- see docs/dead-letter-queue.md.
+
+    Why a separate consumer instead of marking DEAD_LETTERED directly
+    at the moment of nack (in _handle_failure): the DLQ's dead-letter-
+    exchange routing is the actual mechanism RabbitMQ uses to decide
+    a message belongs in the DLQ. Marking the task dead-lettered
+    based on "we nacked it" would be assuming that routing succeeds
+    without checking -- consuming the real dead_letter.queue instead
+    means the task's status reflects where the message actually
+    ended up, not just what this worker intended.
+    """
+
+    async def handle_dlq_message(message: AbstractIncomingMessage) -> None:
+        try:
+            body = json.loads(message.body)
+            task_id = uuid.UUID(body["task_id"])
+        except Exception:
+            # Can't identify which task this was -- nothing to mark,
+            # nothing gained by leaving it in the DLQ forever either.
+            await message.ack()
+            return
+
+        try:
+            await _transition(
+                task_id,
+                TaskStatus.DEAD_LETTERED,
+                event_metadata={"reason": "retries_exhausted_or_permanent_error"},
+            )
+        except (ValueError, InvalidStateTransitionError):
+            # ValueError: no such task (shouldn't happen, but not a
+            # reason to get stuck). InvalidStateTransitionError: the
+            # task has already moved on from FAILED by the time this
+            # DLQ message was processed -- e.g. an administrator
+            # manually retried it (POST /tasks/{id}/retry) and it's
+            # now QUEUED, RUNNING, or even SUCCESS again. That's a
+            # genuine race between this consumer and an admin action,
+            # not a bug: the DLQ message is now stale and safe to
+            # discard, since the task's real current state is
+            # correct without it.
+            pass
+
+        await message.ack()
+
+    return handle_dlq_message

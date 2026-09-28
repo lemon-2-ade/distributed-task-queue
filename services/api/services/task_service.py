@@ -76,6 +76,47 @@ class TaskService:
             repo = TaskRepository(session)
             return await repo.get_by_id(task_id)
 
+    async def list_dead_lettered(self, *, limit: int = 50, offset: int = 0) -> list[Task]:
+        async with AsyncSessionLocal() as session:
+            repo = TaskRepository(session)
+            return await repo.list(status=TaskStatus.DEAD_LETTERED, limit=limit, offset=offset)
+
+    async def retry_dead_lettered_task(self, task_id: uuid.UUID) -> Task | None:
+        """
+        Administrative manual retry (POST /tasks/{id}/retry): only
+        valid for a task that is currently DEAD_LETTERED -- see
+        domain/states/transitions.py for why that's the one allowed
+        exception to "terminal means terminal." Resets retry_count to
+        0, since this is a deliberate fresh start, not a continuation
+        of the automatic retry sequence that already gave up.
+        """
+        async with AsyncSessionLocal() as session:
+            repo = TaskRepository(session)
+            task = await repo.get_by_id(task_id)
+            if task is None:
+                return None
+            if task.status != TaskStatus.DEAD_LETTERED.value:
+                raise ValueError(
+                    f"task {task_id} is {task.status}, not DEAD_LETTERED -- only "
+                    "dead-lettered tasks can be manually retried"
+                )
+            state_manager = TaskStateManager(session)
+            task = await state_manager.transition(
+                task_id,
+                TaskStatus.QUEUED,
+                retry_count=0,
+                event_metadata={"reason": "manual_admin_retry"},
+            )
+            await session.commit()
+
+        await self._publisher.publish_task(
+            task_id=task.task_id,
+            task_type=task.task_type,
+            payload=task.payload,
+            priority=TaskPriority(task.priority),
+        )
+        return task
+
     async def get_events(self, task_id: uuid.UUID) -> list[TaskEvent] | None:
         """Returns None if the task itself doesn't exist (so the
         router can 404), or the task's events in chronological order
