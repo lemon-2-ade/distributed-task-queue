@@ -71,6 +71,7 @@ class TaskStateManager:
         worker_id: str | None = None,
         error: str | None = None,
         result: dict | None = None,
+        retry_count: int | None = None,
         event_metadata: dict | None = None,
     ) -> Task:
         task = await self._session.get(Task, task_id)
@@ -88,7 +89,16 @@ class TaskStateManager:
             task.error = error
         if result is not None:
             task.result = result
+        if retry_count is not None:
+            task.retry_count = retry_count
         if to_status in {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.TIMEOUT}:
+            # Note: this tracks the *current attempt's* completion
+            # time, not "when the task was done for good" -- a
+            # FAILED task that goes on to RETRYING will overwrite
+            # this again on its next attempt. task_attempts holds
+            # the authoritative per-attempt started_at/completed_at
+            # history if every attempt's timing matters, not just
+            # the most recent one.
             task.completed_at = datetime.utcnow()
         if to_status == TaskStatus.RUNNING:
             task.started_at = datetime.utcnow()

@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     worker_heartbeat_interval_seconds: int = 5
     worker_heartbeat_ttl_seconds: int = 15
 
+    # ---- Retries ----
+    # See domain/retry_policy.py for how these combine.
+    retry_base_delay_seconds: float = 1.0
+    retry_max_delay_seconds: float = 60.0
+    retry_jitter_fraction: float = 0.2
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -27,6 +27,9 @@ Phase 5's single-task-at-a-time worker:
   has a ready message and a free consumer slot. The
   priority-drain-order policy (and its starvation tradeoff, see
   docs/rabbitmq.md) is not yet implemented.
+- Retries (Phase 8) republish through this same worker's own
+  TaskPublisher, on the same connection/channel it consumes with --
+  see services/worker/consumer.py for the retry flow itself.
 - Shutdown here cancels the consumers and closes the connection --
   it does not yet drain in-flight work, update a worker registry, or
   distinguish SIGTERM from a crash. Full graceful shutdown is Phase
@@ -39,6 +42,7 @@ import uuid
 
 from config import get_settings
 from messaging.connection import RabbitMQConnection
+from messaging.publisher import TaskPublisher
 from messaging.queues import QUEUE_BY_PRIORITY
 from services.worker.consumer import make_message_handler
 
@@ -55,7 +59,8 @@ async def main() -> None:
 
     await channel.set_qos(prefetch_count=settings.worker_concurrency)
 
-    handler = make_message_handler(WORKER_ID, settings.worker_concurrency)
+    publisher = TaskPublisher(rabbitmq.task_exchange)
+    handler = make_message_handler(WORKER_ID, settings.worker_concurrency, publisher)
 
     consumers = []
     for queue_name in QUEUE_BY_PRIORITY.values():
