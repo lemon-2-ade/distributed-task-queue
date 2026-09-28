@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY pyproject.toml ./
 COPY config.py ./
+COPY alembic.ini ./
 COPY domain ./domain
 COPY messaging ./messaging
 COPY persistence ./persistence

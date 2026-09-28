@@ -20,7 +20,10 @@ No business logic belongs in a router -- see services/api/main.py's
 module docstring for why. These handlers stay this small on purpose.
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response, status
+from sqlalchemy import text
+
+from persistence.database import engine
 
 router = APIRouter(tags=["health"])
 
@@ -31,13 +34,15 @@ async def health() -> dict[str, str]:
 
 
 @router.get("/ready")
-async def ready() -> dict[str, str]:
-    # TODO(phase 3+): check PostgreSQL connectivity once the
-    #   persistence layer exists.
+async def ready(response: Response) -> dict[str, str]:
     # TODO(phase 4+): check RabbitMQ connectivity once the
     #   messaging layer exists.
     # TODO(phase 10+): check Redis connectivity once the
     #   coordination layer exists.
-    # Until those dependencies exist, readiness and liveness are the
-    # same thing: the process is up.
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+    except Exception:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "not ready", "detail": "database unavailable"}
     return {"status": "ready"}
