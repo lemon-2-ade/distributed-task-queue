@@ -35,8 +35,6 @@ async def health() -> dict[str, str]:
 
 @router.get("/ready")
 async def ready(request: Request, response: Response) -> dict[str, str]:
-    # TODO(phase 10+): check Redis connectivity once the
-    #   coordination layer exists.
     problems = []
 
     try:
@@ -48,6 +46,10 @@ async def ready(request: Request, response: Response) -> dict[str, str]:
     rabbitmq = getattr(request.app.state, "rabbitmq", None)
     if rabbitmq is None or not rabbitmq.is_connected:
         problems.append("rabbitmq unavailable")
+
+    worker_registry = getattr(request.app.state, "worker_registry", None)
+    if worker_registry is None or not await worker_registry.ping():
+        problems.append("redis unavailable")
 
     if problems:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE

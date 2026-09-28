@@ -48,3 +48,11 @@ class TaskEventResponse(BaseModel):
     event_type: str
     timestamp: datetime
     event_metadata: dict | None
+
+
+class WorkerResponse(BaseModel):
+    worker_id: str
+    queues: list[str]
+    concurrency: int
+    started_at: float
+    last_heartbeat_at: float

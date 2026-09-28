@@ -34,6 +34,18 @@ Phase 5's single-task-at-a-time worker:
   it does not yet drain in-flight work, update a worker registry, or
   distinguish SIGTERM from a crash. Full graceful shutdown is Phase
   12.
+
+Phase 10 adds the worker registry (coordination/worker_registry.py):
+this worker registers itself in Redis on startup, refreshes that
+entry on a timer (coordination/heartbeat.py) independent of whatever
+message traffic it's handling, and explicitly deregisters on a clean
+shutdown. See coordination/worker_registry.py's module docstring for
+why Redis (TTL-based liveness) rather than Postgres. This phase does
+not yet *use* the registry for anything beyond existing -- no load
+balancing decision reads it yet, only GET /workers on the API side
+does (services/api/routers/workers.py). That's deliberate: knowing
+who's alive is a prerequisite for load-aware scheduling, not the
+same thing as having it.
 """
 
 import asyncio
@@ -41,6 +53,8 @@ import signal
 import uuid
 
 from config import get_settings
+from coordination.heartbeat import run_heartbeat_loop
+from coordination.worker_registry import WorkerRegistry
 from messaging.connection import RabbitMQConnection
 from messaging.publisher import TaskPublisher
 from messaging.queues import DEAD_LETTER_QUEUE, QUEUE_BY_PRIORITY
@@ -63,7 +77,8 @@ async def main() -> None:
     handler = make_message_handler(WORKER_ID, settings.worker_concurrency, publisher)
 
     consumers = []
-    for queue_name in QUEUE_BY_PRIORITY.values():
+    queue_names = list(QUEUE_BY_PRIORITY.values())
+    for queue_name in queue_names:
         queue = await channel.get_queue(queue_name)
         consumer_tag = await queue.consume(handler)
         consumers.append((queue, consumer_tag))
@@ -79,12 +94,23 @@ async def main() -> None:
     dlq_consumer_tag = await dlq_queue.consume(dlq_handler)
     consumers.append((dlq_queue, dlq_consumer_tag))
 
-    print(
-        f"[{WORKER_ID}] consuming from {list(QUEUE_BY_PRIORITY.values())} and {DEAD_LETTER_QUEUE}",
-        flush=True,
+    registry = WorkerRegistry()
+    await registry.register(
+        WORKER_ID, queues=[*queue_names, DEAD_LETTER_QUEUE], concurrency=settings.worker_concurrency
     )
 
     stop_event = asyncio.Event()
+    heartbeat_task = asyncio.create_task(
+        run_heartbeat_loop(
+            registry, WORKER_ID, settings.worker_heartbeat_interval_seconds, stop_event
+        )
+    )
+
+    print(
+        f"[{WORKER_ID}] consuming from {queue_names} and {DEAD_LETTER_QUEUE}",
+        flush=True,
+    )
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)
@@ -92,8 +118,12 @@ async def main() -> None:
     await stop_event.wait()
     print(f"[{WORKER_ID}] shutdown signal received", flush=True)
 
+    await heartbeat_task
+
     for queue, consumer_tag in consumers:
         await queue.cancel(consumer_tag)
+    await registry.deregister(WORKER_ID)
+    await registry.close()
     await rabbitmq.close()
     print(f"[{WORKER_ID}] stopped", flush=True)
 
