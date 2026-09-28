@@ -1,6 +1,6 @@
-# Phase 1: infrastructure only (postgres, rabbitmq, redis).
-# The api/worker/scheduler services are added in later phases once
-# their Dockerfiles exist.
+# Phase 2 adds the `api` service on top of the Phase 1 infrastructure
+# (postgres, rabbitmq, redis). worker/scheduler containers arrive in
+# their own later phases.
 name: distributed-task-queue
 
 services:
@@ -50,6 +50,33 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      REDIS_URL: ${REDIS_URL}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 volumes:
   pgdata:
