@@ -32,7 +32,7 @@ from fastapi import FastAPI
 from config import get_settings
 from messaging.connection import RabbitMQConnection
 from messaging.publisher import TaskPublisher
-from services.api.routers import health
+from services.api.routers import health, tasks
 
 
 @asynccontextmanager
@@ -63,6 +63,7 @@ def create_app() -> FastAPI:
     app.state.settings = settings
 
     app.include_router(health.router)
+    app.include_router(tasks.router)
 
     return app
 

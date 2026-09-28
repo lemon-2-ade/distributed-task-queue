@@ -1,6 +1,5 @@
-# Phase 2 adds the `api` service on top of the Phase 1 infrastructure
-# (postgres, rabbitmq, redis). worker/scheduler containers arrive in
-# their own later phases.
+# Phase 2 added `api`, Phase 5 adds `worker`, on top of the Phase 1
+# infrastructure (postgres, rabbitmq, redis). `scheduler` arrives later.
 name: distributed-task-queue
 
 services:
@@ -77,6 +76,23 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      REDIS_URL: ${REDIS_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
 volumes:
   pgdata:
