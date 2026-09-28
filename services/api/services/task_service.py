@@ -17,11 +17,14 @@ imperfect so the Outbox phase is a visible fix, not a silent one.
 
 import uuid
 
+from sqlalchemy import select
+
 from domain.states import TaskPriority, TaskStatus
 from messaging.publisher import TaskPublisher
 from persistence.database import AsyncSessionLocal
-from persistence.models import Task
+from persistence.models import Task, TaskEvent
 from persistence.repositories.task_repository import TaskRepository
+from persistence.state_manager import TaskStateManager
 
 
 class TaskService:
@@ -40,6 +43,7 @@ class TaskService:
     ) -> Task:
         async with AsyncSessionLocal() as session:
             repo = TaskRepository(session)
+            state_manager = TaskStateManager(session)
             task = await repo.create(
                 task_type=task_type,
                 payload=payload,
@@ -48,6 +52,7 @@ class TaskService:
                 timeout=timeout,
                 idempotency_key=idempotency_key,
             )
+            await state_manager.record_creation(task)
             await session.commit()
 
         # See module docstring: this publish is not part of the
@@ -61,8 +66,8 @@ class TaskService:
         )
 
         async with AsyncSessionLocal() as session:
-            repo = TaskRepository(session)
-            queued_task = await repo.update_status(task.task_id, TaskStatus.QUEUED)
+            state_manager = TaskStateManager(session)
+            queued_task = await state_manager.transition(task.task_id, TaskStatus.QUEUED)
             await session.commit()
         return queued_task
 
@@ -70,3 +75,22 @@ class TaskService:
         async with AsyncSessionLocal() as session:
             repo = TaskRepository(session)
             return await repo.get_by_id(task_id)
+
+    async def get_events(self, task_id: uuid.UUID) -> list[TaskEvent] | None:
+        """Returns None if the task itself doesn't exist (so the
+        router can 404), or the task's events in chronological order
+        otherwise (an empty list is a valid, real answer -- a task
+        that exists but somehow has no recorded events yet)."""
+        async with AsyncSessionLocal() as session:
+            repo = TaskRepository(session)
+            task = await repo.get_by_id(task_id)
+            if task is None:
+                return None
+
+            stmt = (
+                select(TaskEvent)
+                .where(TaskEvent.task_id == task_id)
+                .order_by(TaskEvent.timestamp.asc())
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())

@@ -77,6 +77,16 @@ class TaskRepository:
         status: TaskStatus,
         **fields: object,
     ) -> Task | None:
+        """
+        Low-level, unconditional status write: no state-machine
+        validation, no TaskEvent, no TaskAttempt bookkeeping. Kept
+        for callers that genuinely don't need those (tests, one-off
+        scripts). Anything that's part of a task's real lifecycle
+        (the worker, the API) should go through
+        persistence.state_manager.TaskStateManager instead, which
+        wraps this same kind of write with the transition validation
+        and audit trail that make /tasks/{id}/events meaningful.
+        """
         task = await self.get_by_id(task_id)
         if task is None:
             return None

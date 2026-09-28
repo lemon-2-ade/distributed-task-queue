@@ -10,7 +10,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException, Request, status
 
-from services.api.schemas import TaskCreateRequest, TaskResponse
+from services.api.schemas import TaskCreateRequest, TaskEventResponse, TaskResponse
 from services.api.services.task_service import TaskService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -41,3 +41,12 @@ async def get_task(task_id: uuid.UUID, request: Request) -> TaskResponse:
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
     return TaskResponse.model_validate(task)
+
+
+@router.get("/{task_id}/events", response_model=list[TaskEventResponse])
+async def get_task_events(task_id: uuid.UUID, request: Request) -> list[TaskEventResponse]:
+    service = _get_task_service(request)
+    events = await service.get_events(task_id)
+    if events is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
+    return [TaskEventResponse.model_validate(e) for e in events]

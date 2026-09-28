@@ -38,3 +38,13 @@ class TaskResponse(BaseModel):
     result: dict | None
     error: str | None
     idempotency_key: str | None
+
+
+class TaskEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    task_id: uuid.UUID
+    event_type: str
+    timestamp: datetime
+    event_metadata: dict | None
