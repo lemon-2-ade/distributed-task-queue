@@ -56,3 +56,4 @@ class WorkerResponse(BaseModel):
     concurrency: int
     started_at: float
     last_heartbeat_at: float
+    active_task_count: int

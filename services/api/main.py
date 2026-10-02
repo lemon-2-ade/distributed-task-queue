@@ -26,6 +26,11 @@ meant to be reused, not opened and closed per call.
 Phase 10 adds a WorkerRegistry, read-only from the API's side (only
 workers themselves register/heartbeat/deregister -- see
 services/worker/main.py) so GET /workers and /ready can both use it.
+
+Phase 11 adds the load balancing strategy instances backing
+GET /workers/select. RoundRobinStrategy is constructed once here
+(not per-request) specifically because it's stateful -- see
+coordination/load_balancer.py.
 """
 
 from collections.abc import AsyncGenerator
@@ -34,6 +39,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from config import get_settings
+from coordination.load_balancer import LeastLoadedStrategy, RoundRobinStrategy
 from coordination.worker_registry import WorkerRegistry
 from messaging.connection import RabbitMQConnection
 from messaging.publisher import TaskPublisher
@@ -48,6 +54,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.publisher = TaskPublisher(rabbitmq.task_exchange)
 
     app.state.worker_registry = WorkerRegistry()
+    # RoundRobinStrategy is stateful (an internal counter) and must
+    # be a single long-lived instance shared across requests, or
+    # every call would reset to "pick the first worker" -- see
+    # coordination/load_balancer.py. LeastLoadedStrategy is stateless
+    # but kept here too, for one consistent lookup table.
+    app.state.load_balancer_strategies = {
+        "round_robin": RoundRobinStrategy(),
+        "least_loaded": LeastLoadedStrategy(),
+    }
     try:
         yield
     finally:

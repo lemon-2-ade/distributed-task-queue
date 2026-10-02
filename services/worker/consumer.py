@@ -28,6 +28,16 @@ Retries (Phase 8): a handler failure is one of two things --
    watches the DLQ and does that; this phase only gets the message
    there.
 
+Load tracking (Phase 11): every in-flight message bumps this
+worker's active_task_count in the registry (coordination/
+worker_registry.py) for the duration it holds a semaphore slot,
+decremented in a `finally` so it's accurate even on every exit path
+above (parse success but task-not-found, no handler, success,
+failure-into-retry, failure-into-DLQ). This is what makes
+LeastLoadedStrategy's notion of "load" (coordination/load_balancer.py)
+correspond to real, current work rather than something stale or
+inferred.
+
 Deliberate tradeoff, not an oversight: sleeping for the backoff delay
 happens *inside* this handler, while holding both the semaphore slot
 (Phase 6) and the original message unacked. That means a retrying
@@ -58,6 +68,7 @@ import uuid
 from aio_pika.abc import AbstractIncomingMessage
 
 from config import get_settings
+from coordination.worker_registry import WorkerRegistry
 from domain.exceptions import InvalidStateTransitionError, PermanentTaskError
 from domain.retry_policy import compute_backoff_seconds
 from domain.states import TaskPriority, TaskStatus
@@ -68,12 +79,16 @@ from persistence.state_manager import TaskStateManager
 from task_handlers import TASK_HANDLERS
 
 
-def make_message_handler(worker_id: str, concurrency: int, publisher: TaskPublisher):
+def make_message_handler(
+    worker_id: str, concurrency: int, publisher: TaskPublisher, registry: WorkerRegistry
+):
     """
     Returns a message callback bound to this worker's id (recorded
     on every attempt), a concurrency limit of at most `concurrency`
-    handlers running at once, and a `publisher` used to republish a
-    task for its next attempt after a transient failure.
+    handlers running at once, a `publisher` used to republish a task
+    for its next attempt after a transient failure, and a `registry`
+    used to report this worker's current load (Phase 11) so
+    LeastLoadedStrategy has something real to read.
     """
     semaphore = asyncio.Semaphore(concurrency)
     settings = get_settings()
@@ -88,45 +103,60 @@ def make_message_handler(worker_id: str, concurrency: int, publisher: TaskPublis
                 priority = TaskPriority(body["priority"])
             except Exception:
                 # Can't even parse this message -- definitely not
-                # something a retry would fix.
+                # something a retry would fix, and not a real task
+                # this worker is "working on," so it never counts
+                # toward active_task_count below.
                 await message.nack(requeue=False)
                 return
 
+            # Bracket everything from here on with the load counter:
+            # this message now occupies one of this worker's
+            # WORKER_CONCURRENCY slots for real, for as long as it
+            # takes to reach an ack/nack (including any retry-backoff
+            # sleep in _handle_failure) -- see
+            # coordination/worker_registry.py's increment_load()/
+            # decrement_load() docstrings for why this is a Redis
+            # HINCRBY rather than a plain counter, and why the
+            # decrement side guards against going negative.
+            await registry.increment_load(worker_id)
             try:
-                await _transition(task_id, TaskStatus.RUNNING, worker_id=worker_id)
-            except ValueError:
-                # No matching task row: a stray or duplicate-delivered
-                # message referencing a task we don't know about.
-                await message.nack(requeue=False)
-                return
+                try:
+                    await _transition(task_id, TaskStatus.RUNNING, worker_id=worker_id)
+                except ValueError:
+                    # No matching task row: a stray or duplicate-delivered
+                    # message referencing a task we don't know about.
+                    await message.nack(requeue=False)
+                    return
 
-            handler = TASK_HANDLERS.get(task_type)
-            if handler is None:
-                await _transition(
-                    task_id,
-                    TaskStatus.FAILED,
-                    error=f"no handler registered for task_type={task_type!r}",
-                )
-                await message.nack(requeue=False)
-                return
+                handler = TASK_HANDLERS.get(task_type)
+                if handler is None:
+                    await _transition(
+                        task_id,
+                        TaskStatus.FAILED,
+                        error=f"no handler registered for task_type={task_type!r}",
+                    )
+                    await message.nack(requeue=False)
+                    return
 
-            try:
-                result = await handler(payload)
-            except Exception as exc:
-                await _handle_failure(
-                    message,
-                    task_id=task_id,
-                    task_type=task_type,
-                    payload=payload,
-                    priority=priority,
-                    error=exc,
-                    publisher=publisher,
-                    settings=settings,
-                )
-                return
+                try:
+                    result = await handler(payload)
+                except Exception as exc:
+                    await _handle_failure(
+                        message,
+                        task_id=task_id,
+                        task_type=task_type,
+                        payload=payload,
+                        priority=priority,
+                        error=exc,
+                        publisher=publisher,
+                        settings=settings,
+                    )
+                    return
 
-            await _transition(task_id, TaskStatus.SUCCESS, result=result)
-            await message.ack()
+                await _transition(task_id, TaskStatus.SUCCESS, result=result)
+                await message.ack()
+            finally:
+                await registry.decrement_load(worker_id)
 
     return handle_message
 

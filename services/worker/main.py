@@ -40,12 +40,18 @@ this worker registers itself in Redis on startup, refreshes that
 entry on a timer (coordination/heartbeat.py) independent of whatever
 message traffic it's handling, and explicitly deregisters on a clean
 shutdown. See coordination/worker_registry.py's module docstring for
-why Redis (TTL-based liveness) rather than Postgres. This phase does
-not yet *use* the registry for anything beyond existing -- no load
-balancing decision reads it yet, only GET /workers on the API side
-does (services/api/routers/workers.py). That's deliberate: knowing
-who's alive is a prerequisite for load-aware scheduling, not the
-same thing as having it.
+why Redis (TTL-based liveness) rather than Postgres.
+
+Phase 11 adds load reporting: the registry's active_task_count field
+is kept current by services/worker/consumer.py (incremented/
+decremented around each handler invocation), which is what makes
+coordination/load_balancer.py's LeastLoadedStrategy meaningful rather
+than reading a field nothing ever updates. GET /workers/select on the
+API side (services/api/routers/workers.py) is the only thing reading
+these strategies right now -- still nothing in the dispatch path
+itself uses them, same as Phase 10's "knowing who's alive isn't the
+same as using it" note, now extended to "knowing how loaded they are
+isn't either."
 """
 
 import asyncio
@@ -73,8 +79,10 @@ async def main() -> None:
 
     await channel.set_qos(prefetch_count=settings.worker_concurrency)
 
+    registry = WorkerRegistry()
+
     publisher = TaskPublisher(rabbitmq.task_exchange)
-    handler = make_message_handler(WORKER_ID, settings.worker_concurrency, publisher)
+    handler = make_message_handler(WORKER_ID, settings.worker_concurrency, publisher, registry)
 
     consumers = []
     queue_names = list(QUEUE_BY_PRIORITY.values())
@@ -94,7 +102,6 @@ async def main() -> None:
     dlq_consumer_tag = await dlq_queue.consume(dlq_handler)
     consumers.append((dlq_queue, dlq_consumer_tag))
 
-    registry = WorkerRegistry()
     await registry.register(
         WORKER_ID, queues=[*queue_names, DEAD_LETTER_QUEUE], concurrency=settings.worker_concurrency
     )

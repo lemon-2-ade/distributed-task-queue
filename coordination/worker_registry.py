@@ -75,6 +75,12 @@ class WorkerRegistry:
                 "concurrency": concurrency,
                 "started_at": now,
                 "last_heartbeat_at": now,
+                # active_task_count (Phase 11): how many messages this
+                # worker currently has "in flight" through its handler
+                # body -- see increment_load()/decrement_load() below,
+                # and services/worker/consumer.py for where these are
+                # called. Starts at 0 on every fresh registration.
+                "active_task_count": 0,
             },
         )
         await self._redis.expire(key, self._ttl_seconds)
@@ -91,6 +97,26 @@ class WorkerRegistry:
         # register() to be called again for heartbeat() to keep working.
         await self._redis.hset(key, "last_heartbeat_at", time.time())
         await self._redis.expire(key, self._ttl_seconds)
+
+    async def increment_load(self, worker_id: str) -> None:
+        # HINCRBY is a single atomic Redis command -- safe to call
+        # concurrently from every in-flight handler on this worker
+        # (up to WORKER_CONCURRENCY of them, see consumer.py) without
+        # a read-modify-write race, which a naive "read the field,
+        # add one, write it back" would have.
+        await self._redis.hincrby(_worker_key(worker_id), "active_task_count", 1)
+
+    async def decrement_load(self, worker_id: str) -> None:
+        # Never let this go negative -- e.g. a decrement arriving after
+        # the key already expired and got silently recreated by a
+        # heartbeat (see heartbeat()'s docstring for that same
+        # recreate-on-expiry behavior), which would start this field
+        # at -1 instead of 0. A negative count would make this worker
+        # look *more* available than an idle one to
+        # LeastLoadedStrategy, which is the opposite of correct.
+        new_value = await self._redis.hincrby(_worker_key(worker_id), "active_task_count", -1)
+        if new_value < 0:
+            await self._redis.hset(_worker_key(worker_id), "active_task_count", 0)
 
     async def deregister(self, worker_id: str) -> None:
         # Explicit removal on graceful shutdown, so a clean stop
