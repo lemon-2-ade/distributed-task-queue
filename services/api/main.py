@@ -31,6 +31,11 @@ Phase 11 adds the load balancing strategy instances backing
 GET /workers/select. RoundRobinStrategy is constructed once here
 (not per-request) specifically because it's stateful -- see
 coordination/load_balancer.py.
+
+Phase 12 adds a CancellationBroadcaster, used by
+POST /tasks/{id}/cancel to ask a RUNNING task's owning worker to stop
+it -- see coordination/cancellation.py and
+services/api/services/task_service.py's cancel_task().
 """
 
 from collections.abc import AsyncGenerator
@@ -39,6 +44,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from config import get_settings
+from coordination.cancellation import CancellationBroadcaster
 from coordination.load_balancer import LeastLoadedStrategy, RoundRobinStrategy
 from coordination.worker_registry import WorkerRegistry
 from messaging.connection import RabbitMQConnection
@@ -54,6 +60,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.publisher = TaskPublisher(rabbitmq.task_exchange)
 
     app.state.worker_registry = WorkerRegistry()
+    app.state.cancellation_broadcaster = CancellationBroadcaster()
     # RoundRobinStrategy is stateful (an internal counter) and must
     # be a single long-lived instance shared across requests, or
     # every call would reset to "pick the first worker" -- see
@@ -68,6 +75,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         await rabbitmq.close()
         await app.state.worker_registry.close()
+        await app.state.cancellation_broadcaster.close()
 
 
 def create_app() -> FastAPI:

@@ -30,10 +30,6 @@ Phase 5's single-task-at-a-time worker:
 - Retries (Phase 8) republish through this same worker's own
   TaskPublisher, on the same connection/channel it consumes with --
   see services/worker/consumer.py for the retry flow itself.
-- Shutdown here cancels the consumers and closes the connection --
-  it does not yet drain in-flight work, update a worker registry, or
-  distinguish SIGTERM from a crash. Full graceful shutdown is Phase
-  12.
 
 Phase 10 adds the worker registry (coordination/worker_registry.py):
 this worker registers itself in Redis on startup, refreshes that
@@ -52,6 +48,28 @@ these strategies right now -- still nothing in the dispatch path
 itself uses them, same as Phase 10's "knowing who's alive isn't the
 same as using it" note, now extended to "knowing how loaded they are
 isn't either."
+
+Phase 12 adds three things on top of all of the above, all powered
+by the same MessageHandler object (services/worker/consumer.py):
+- **Timeouts**: handled entirely inside consumer.py's handle() --
+  nothing here.
+- **Cancellation**: this process runs a background task
+  (`_run_cancellation_listener`) subscribed to coordination/
+  cancellation.py's Pub/Sub channel. A cancellation request naming a
+  task_id this worker is currently running (checked via
+  `message_handler.running_tasks`) gets `cancel_task()` called on it;
+  requests for tasks this worker doesn't own are silently ignored,
+  since every worker sees every request on the shared channel.
+- **Graceful shutdown**: SIGTERM now cancels the AMQP consumers
+  (stops *new* deliveries) before anything else, then calls
+  `message_handler.wait_for_drain()` to give in-flight handlers up to
+  WORKER_SHUTDOWN_GRACE_PERIOD_SECONDS to finish **on their own**
+  before closing any connections. Closing the RabbitMQ connection out
+  from under a still-running handler would drop that handler's
+  eventual ack/nack entirely, which is exactly the kind of silent
+  task loss this whole project exists to avoid. See
+  docs/graceful-shutdown.md for what happens to whatever is still
+  running after the grace period elapses.
 """
 
 import asyncio
@@ -59,14 +77,29 @@ import signal
 import uuid
 
 from config import get_settings
+from coordination.cancellation import CancellationBroadcaster
 from coordination.heartbeat import run_heartbeat_loop
 from coordination.worker_registry import WorkerRegistry
 from messaging.connection import RabbitMQConnection
 from messaging.publisher import TaskPublisher
 from messaging.queues import DEAD_LETTER_QUEUE, QUEUE_BY_PRIORITY
-from services.worker.consumer import make_dlq_handler, make_message_handler
+from services.worker.consumer import MessageHandler, make_dlq_handler, make_message_handler
 
 WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
+
+
+async def _run_cancellation_listener(
+    broadcaster: CancellationBroadcaster, message_handler: MessageHandler, worker_id: str
+) -> None:
+    async for task_id, target_worker_id in broadcaster.listen():
+        if target_worker_id != worker_id:
+            # Every worker sees every request on the shared channel
+            # (coordination/cancellation.py) -- this is the filter
+            # that makes that safe. Not an error, not logged loudly:
+            # this is the expected common case on any worker that
+            # isn't the one running the named task.
+            continue
+        message_handler.cancel_task(task_id)
 
 
 async def main() -> None:
@@ -82,13 +115,15 @@ async def main() -> None:
     registry = WorkerRegistry()
 
     publisher = TaskPublisher(rabbitmq.task_exchange)
-    handler = make_message_handler(WORKER_ID, settings.worker_concurrency, publisher, registry)
+    message_handler = make_message_handler(
+        WORKER_ID, settings.worker_concurrency, publisher, registry
+    )
 
     consumers = []
     queue_names = list(QUEUE_BY_PRIORITY.values())
     for queue_name in queue_names:
         queue = await channel.get_queue(queue_name)
-        consumer_tag = await queue.consume(handler)
+        consumer_tag = await queue.consume(message_handler.handle)
         consumers.append((queue, consumer_tag))
 
     # Every worker also consumes the DLQ (Phase 9) -- there's no
@@ -113,6 +148,11 @@ async def main() -> None:
         )
     )
 
+    cancellation_broadcaster = CancellationBroadcaster()
+    cancellation_listener_task = asyncio.create_task(
+        _run_cancellation_listener(cancellation_broadcaster, message_handler, WORKER_ID)
+    )
+
     print(
         f"[{WORKER_ID}] consuming from {queue_names} and {DEAD_LETTER_QUEUE}",
         flush=True,
@@ -123,12 +163,52 @@ async def main() -> None:
         loop.add_signal_handler(sig, stop_event.set)
 
     await stop_event.wait()
-    print(f"[{WORKER_ID}] shutdown signal received", flush=True)
+    print(f"[{WORKER_ID}] shutdown signal received, stopping consumers", flush=True)
 
-    await heartbeat_task
-
+    # Stop accepting *new* deliveries first -- everything after this
+    # point only concerns work already in flight.
     for queue, consumer_tag in consumers:
         await queue.cancel(consumer_tag)
+
+    still_running = await message_handler.wait_for_drain(
+        settings.worker_shutdown_grace_period_seconds
+    )
+    if still_running:
+        # The grace period elapsed with handlers still going. They
+        # are *not* force-cancelled here: cancelling them now would
+        # mean their in-flight work (a partially-run handler,
+        # possibly non-idempotent side effects) gets abandoned
+        # mid-execution with no chance to even record a FAILED/
+        # TIMEOUT/CANCELLED status, since the Postgres/RabbitMQ
+        # connections this process needs to do that are about to be
+        # closed anyway. The honest tradeoff here: a worker process
+        # that's killed (not just asked to stop) after this point
+        # will lose track of these tasks until their messages'
+        # absence of an ack eventually triggers RabbitMQ's own
+        # redelivery-on-connection-loss behavior -- see
+        # docs/graceful-shutdown.md.
+        print(
+            f"[{WORKER_ID}] grace period elapsed with {len(still_running)} handler(s) "
+            "still running -- proceeding with shutdown anyway",
+            flush=True,
+        )
+    else:
+        print(f"[{WORKER_ID}] all in-flight work drained cleanly", flush=True)
+
+    # heartbeat_task already respects stop_event on its own (see
+    # coordination/heartbeat.py) and is already exiting by this
+    # point -- just await it rather than cancelling. The
+    # cancellation listener, on the other hand, is an unconditional
+    # `async for` over a Pub/Sub stream with no stop_event awareness
+    # of its own, so it genuinely needs to be cancelled to end.
+    await heartbeat_task
+    cancellation_listener_task.cancel()
+    try:
+        await cancellation_listener_task
+    except asyncio.CancelledError:
+        pass
+
+    await cancellation_broadcaster.close()
     await registry.deregister(WORKER_ID)
     await registry.close()
     await rabbitmq.close()

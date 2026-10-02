@@ -22,7 +22,7 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
 def _get_task_service(request: Request) -> TaskService:
-    return TaskService(request.app.state.publisher)
+    return TaskService(request.app.state.publisher, request.app.state.cancellation_broadcaster)
 
 
 @router.post("", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
@@ -71,6 +71,29 @@ async def retry_task(task_id: uuid.UUID, request: Request) -> TaskResponse:
     service = _get_task_service(request)
     try:
         task = await service.retry_dead_lettered_task(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
+    return TaskResponse.model_validate(task)
+
+
+@router.post("/{task_id}/cancel", response_model=TaskResponse)
+async def cancel_task(task_id: uuid.UUID, request: Request) -> TaskResponse:
+    """
+    For a PENDING/QUEUED task, the response already reflects
+    status="CANCELLED" -- it happened synchronously. For a RUNNING
+    task, the response still shows status="RUNNING": a cancellation
+    request has been sent to the owning worker, but this call does
+    not wait for (or guarantee) it actually taking effect. Poll
+    GET /tasks/{task_id} to see when it actually lands. See
+    TaskService.cancel_task()'s docstring and
+    docs/timeouts-and-cancellation.md for why this isn't synchronous
+    for a RUNNING task.
+    """
+    service = _get_task_service(request)
+    try:
+        task = await service.cancel_task(task_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if task is None:

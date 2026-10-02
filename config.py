@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     worker_concurrency: int = 10
     worker_heartbeat_interval_seconds: int = 5
     worker_heartbeat_ttl_seconds: int = 15
+    # Populated in Phase 12 alongside graceful shutdown: how long
+    # SIGTERM waits for in-flight handlers to finish on their own
+    # before giving up on them and closing connections anyway.
+    worker_shutdown_grace_period_seconds: int = 30
 
     # ---- Retries ----
     # See domain/retry_policy.py for how these combine.
