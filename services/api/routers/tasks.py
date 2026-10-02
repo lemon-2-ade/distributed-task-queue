@@ -13,7 +13,7 @@ this one.
 
 import uuid
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 
 from services.api.schemas import TaskCreateRequest, TaskEventResponse, TaskResponse
 from services.api.services.task_service import TaskService
@@ -25,10 +25,20 @@ def _get_task_service(request: Request) -> TaskService:
     return TaskService(request.app.state.publisher, request.app.state.cancellation_broadcaster)
 
 
-@router.post("", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
-async def create_task(body: TaskCreateRequest, request: Request) -> TaskResponse:
+@router.post("", response_model=TaskResponse)
+async def create_task(body: TaskCreateRequest, request: Request, response: Response) -> TaskResponse:
+    """
+    status_code is set dynamically rather than fixed at 201: a
+    request whose idempotency_key matches an existing task (Phase 13)
+    returns 200 with that existing task instead of creating a new
+    one, so a client can tell "this is the task you already made" (200)
+    apart from "this is a brand new task" (201) -- both correct
+    responses to the same request body, depending on whether this was
+    a first attempt or a safe retry. See
+    services/api/services/task_service.py's create_task() docstring.
+    """
     service = _get_task_service(request)
-    task = await service.create_task(
+    task, was_created = await service.create_task(
         task_type=body.task_type,
         payload=body.payload,
         priority=body.priority,
@@ -36,6 +46,7 @@ async def create_task(body: TaskCreateRequest, request: Request) -> TaskResponse
         timeout=body.timeout,
         idempotency_key=body.idempotency_key,
     )
+    response.status_code = status.HTTP_201_CREATED if was_created else status.HTTP_200_OK
     return TaskResponse.model_validate(task)
 
 

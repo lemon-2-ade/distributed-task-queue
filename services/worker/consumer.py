@@ -81,6 +81,15 @@ of indirection is what makes both features possible:
 See docs/timeouts-and-cancellation.md for the full design and the
 races this has to account for.
 
+Idempotency (Phase 13): the RUNNING-transition except block now
+distinguishes a redelivery arriving for an already-RUNNING task
+(recorded, not silently dropped or blindly re-run -- see
+docs/idempotency.md) from every other "stale by the time it arrived"
+case. This is the other half of what docs/rabbitmq.md's "ACK timing"
+section promises and defers to this phase: at-least-once delivery
+means a message CAN come back, and this is where that's finally
+handled explicitly instead of being an unexamined gap.
+
 Every `handle()` invocation also registers itself (via
 `asyncio.current_task()`) in `MessageHandler.in_flight`, which is
 what `services/worker/main.py`'s graceful shutdown drains on SIGTERM
@@ -194,17 +203,46 @@ class MessageHandler:
                     # message referencing a task we don't know about.
                     await message.nack(requeue=False)
                     return
-                except InvalidStateTransitionError:
+                except InvalidStateTransitionError as exc:
                     # The task exists but isn't QUEUED/PENDING any
-                    # more by the time this delivery arrived -- the
-                    # one real case this covers today is an admin
-                    # cancelling a PENDING/QUEUED task
-                    # (services/api/services/task_service.py): the
-                    # task is already CANCELLED, but RabbitMQ has no
-                    # way to recall the message that was already
-                    # published before that happened. Nothing to run;
-                    # just ack and move on. See
-                    # docs/timeouts-and-cancellation.md.
+                    # more by the time this delivery arrived. Two
+                    # genuinely different situations share this
+                    # exception, distinguished by exc.from_status
+                    # (Phase 13 -- see docs/idempotency.md):
+                    if exc.from_status == TaskStatus.RUNNING:
+                        # A RabbitMQ redelivery for a task that's
+                        # *already* RUNNING -- the exact scenario
+                        # docs/rabbitmq.md warns about: a consumer
+                        # can crash before acking, and the broker
+                        # redelivers. This worker (or another one)
+                        # already has -- or recently had -- this
+                        # task's handler running. Re-running it here
+                        # risks a non-idempotent handler's side
+                        # effects happening twice; silently dropping
+                        # it risks losing the only copy of the work
+                        # if the *original* attempt is the one that's
+                        # actually dead. This project doesn't have a
+                        # fencing/lease mechanism to tell those two
+                        # cases apart (a real gap, not a solved
+                        # problem -- see docs/idempotency.md), so it
+                        # takes the side that never silently
+                        # double-executes: record the duplicate for
+                        # visibility and discard this delivery. If
+                        # the original attempt really did die, the
+                        # task is left visibly stuck at RUNNING --
+                        # recoverable via the admin
+                        # POST /tasks/{id}/cancel endpoint Phase 12
+                        # already built, not by this consumer
+                        # guessing.
+                        await _record_duplicate_delivery(
+                            task_id, event_metadata={"worker_id": self.worker_id}
+                        )
+                    # Otherwise: the task reached some other status
+                    # entirely by the time this arrived -- the clearest
+                    # case is an admin cancelling a PENDING/QUEUED task
+                    # (services/api/services/task_service.py) whose
+                    # message had already been published and can't be
+                    # recalled. See docs/timeouts-and-cancellation.md.
                     await message.ack()
                     return
 
@@ -360,6 +398,13 @@ async def _transition(task_id: uuid.UUID, to_status: TaskStatus, **kwargs: objec
         task = await state_manager.transition(task_id, to_status, **kwargs)
         await session.commit()
         return task
+
+
+async def _record_duplicate_delivery(task_id: uuid.UUID, *, event_metadata: dict) -> None:
+    async with AsyncSessionLocal() as session:
+        state_manager = TaskStateManager(session)
+        await state_manager.record_duplicate_delivery(task_id, event_metadata=event_metadata)
+        await session.commit()
 
 
 def make_dlq_handler():

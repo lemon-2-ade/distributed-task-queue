@@ -15,3 +15,8 @@ class TaskEventType(StrEnum):
     TASK_CANCELLED = "TASK_CANCELLED"
     TASK_TIMEOUT = "TASK_TIMEOUT"
     TASK_DEAD_LETTERED = "TASK_DEAD_LETTERED"
+    # Phase 13: recorded (not a status change) when a redelivered
+    # message arrives for a task that's already RUNNING -- see
+    # persistence/state_manager.py's record_duplicate_delivery() and
+    # docs/idempotency.md.
+    DUPLICATE_DELIVERY_DETECTED = "DUPLICATE_DELIVERY_DETECTED"

@@ -18,6 +18,7 @@ imperfect so the Outbox phase is a visible fix, not a silent one.
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from coordination.cancellation import CancellationBroadcaster
 from domain.states import TaskPriority, TaskStatus
@@ -51,7 +52,23 @@ class TaskService:
         max_retries: int,
         timeout: int | None,
         idempotency_key: str | None,
-    ) -> Task:
+    ) -> tuple[Task, bool]:
+        """
+        Returns (task, was_created). was_created=False means an
+        idempotency_key collision returned an existing task instead
+        of creating a new one -- see docs/idempotency.md for why this
+        exists (safe client-side retry of the POST /tasks request
+        itself, distinct from the worker-side redelivery dedup in
+        services/worker/consumer.py) and the two distinct races this
+        method has to handle.
+        """
+        if idempotency_key is not None:
+            async with AsyncSessionLocal() as session:
+                repo = TaskRepository(session)
+                existing = await repo.get_by_idempotency_key(idempotency_key)
+                if existing is not None:
+                    return existing, False
+
         async with AsyncSessionLocal() as session:
             repo = TaskRepository(session)
             state_manager = TaskStateManager(session)
@@ -64,7 +81,25 @@ class TaskService:
                 idempotency_key=idempotency_key,
             )
             await state_manager.record_creation(task)
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError:
+                # Lost the race: between the lookup above and this
+                # commit, a concurrent request with the *same*
+                # idempotency_key already inserted its row first, and
+                # the unique constraint on Task.idempotency_key
+                # (Phase 3) rejected this one. This isn't a real
+                # error from the caller's point of view -- it's the
+                # same "this idempotency_key already has a task"
+                # outcome the lookup above was trying to catch, just
+                # discovered a few milliseconds later than it could
+                # have been. Roll back this half-finished insert and
+                # hand back whichever row actually won the race.
+                await session.rollback()
+                existing = await repo.get_by_idempotency_key(idempotency_key)
+                if existing is not None:
+                    return existing, False
+                raise  # genuinely unexpected: re-raise rather than hide it
 
         # See module docstring: this publish is not part of the
         # transaction above. A crash right here is the dual-write
@@ -80,7 +115,7 @@ class TaskService:
             state_manager = TaskStateManager(session)
             queued_task = await state_manager.transition(task.task_id, TaskStatus.QUEUED)
             await session.commit()
-        return queued_task
+        return queued_task, True
 
     async def get_task(self, task_id: uuid.UUID) -> Task | None:
         async with AsyncSessionLocal() as session:

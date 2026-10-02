@@ -63,6 +63,31 @@ class TaskStateManager:
         )
         await self._session.flush()
 
+    async def record_duplicate_delivery(
+        self, task_id: uuid.UUID, event_metadata: dict | None = None
+    ) -> None:
+        """
+        Phase 13: called when a RabbitMQ redelivery arrives for a
+        task that's already RUNNING (see
+        services/worker/consumer.py) -- i.e. at-least-once delivery
+        doing exactly what it's documented to do (docs/rabbitmq.md).
+        This is deliberately *not* a transition() call: there's no
+        status change here (the task stays RUNNING, whatever its
+        original attempt is doing), just a visible mark in
+        GET /tasks/{id}/events that this happened, so it's
+        diagnosable rather than silently dropped. See
+        docs/idempotency.md for why the task's status is left alone
+        rather than guessed at.
+        """
+        self._session.add(
+            TaskEvent(
+                task_id=task_id,
+                event_type=TaskEventType.DUPLICATE_DELIVERY_DETECTED.value,
+                event_metadata=event_metadata,
+            )
+        )
+        await self._session.flush()
+
     async def transition(
         self,
         task_id: uuid.UUID,
