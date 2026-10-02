@@ -15,6 +15,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
+from messaging.backpressure import get_total_queue_depth
 from services.api.schemas import TaskCreateRequest, TaskEventResponse, TaskResponse
 from services.api.services.task_service import TaskService
 
@@ -23,6 +24,36 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 def _get_task_service(request: Request) -> TaskService:
     return TaskService(request.app.state.publisher, request.app.state.cancellation_broadcaster)
+
+
+async def _check_rate_limit(request: Request) -> None:
+    """Checked first -- it's the cheap, single-Redis-call guard.
+    Backpressure is checked second because it costs an extra
+    RabbitMQ round trip (a passive queue declare per priority queue),
+    not worth paying if the request was already going to be rejected
+    for a simpler reason. See docs/rate-limiting-and-backpressure.md."""
+    allowed, retry_after = await request.app.state.rate_limiter.check()
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="rate limit exceeded",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+async def _check_backpressure(request: Request) -> None:
+    settings = request.app.state.settings
+    channel = request.app.state.rabbitmq.channel
+    depth = await get_total_queue_depth(channel)
+    if depth >= settings.backpressure_max_queue_depth:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"queue backlog ({depth}) at or above the configured limit "
+                f"({settings.backpressure_max_queue_depth}) -- try again shortly"
+            ),
+            headers={"Retry-After": "5"},
+        )
 
 
 @router.post("", response_model=TaskResponse)
@@ -37,6 +68,8 @@ async def create_task(body: TaskCreateRequest, request: Request, response: Respo
     a first attempt or a safe retry. See
     services/api/services/task_service.py's create_task() docstring.
     """
+    await _check_rate_limit(request)
+    await _check_backpressure(request)
     service = _get_task_service(request)
     task, was_created = await service.create_task(
         task_type=body.task_type,

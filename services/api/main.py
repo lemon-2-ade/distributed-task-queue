@@ -36,6 +36,11 @@ Phase 12 adds a CancellationBroadcaster, used by
 POST /tasks/{id}/cancel to ask a RUNNING task's owning worker to stop
 it -- see coordination/cancellation.py and
 services/api/services/task_service.py's cancel_task().
+
+Phase 14 adds a RateLimiter, checked (along with queue-depth
+backpressure, messaging/backpressure.py) at the top of
+POST /tasks -- see services/api/routers/tasks.py and
+docs/rate-limiting-and-backpressure.md.
 """
 
 from collections.abc import AsyncGenerator
@@ -46,6 +51,7 @@ from fastapi import FastAPI
 from config import get_settings
 from coordination.cancellation import CancellationBroadcaster
 from coordination.load_balancer import LeastLoadedStrategy, RoundRobinStrategy
+from coordination.rate_limiter import RateLimiter
 from coordination.worker_registry import WorkerRegistry
 from messaging.connection import RabbitMQConnection
 from messaging.publisher import TaskPublisher
@@ -61,6 +67,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     app.state.worker_registry = WorkerRegistry()
     app.state.cancellation_broadcaster = CancellationBroadcaster()
+    app.state.rate_limiter = RateLimiter()
     # RoundRobinStrategy is stateful (an internal counter) and must
     # be a single long-lived instance shared across requests, or
     # every call would reset to "pick the first worker" -- see
@@ -76,6 +83,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await rabbitmq.close()
         await app.state.worker_registry.close()
         await app.state.cancellation_broadcaster.close()
+        await app.state.rate_limiter.close()
 
 
 def create_app() -> FastAPI:

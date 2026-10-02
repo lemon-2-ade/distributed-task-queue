@@ -60,6 +60,21 @@ class Settings(BaseSettings):
     # before giving up on them and closing connections anyway.
     worker_shutdown_grace_period_seconds: int = 30
 
+    # ---- Rate limiting and backpressure ----
+    # Populated in Phase 14. Fixed-window counter in Redis: at most
+    # rate_limit_requests_per_window POST /tasks calls per
+    # rate_limit_window_seconds, system-wide (see
+    # coordination/rate_limiter.py for why "system-wide" rather than
+    # per-client -- this project has no per-caller identity yet).
+    rate_limit_requests_per_window: int = 100
+    rate_limit_window_seconds: int = 1
+    # Admission control on top of the rate limiter: reject new task
+    # submissions outright once the combined depth of the three
+    # priority queues passes this, rather than letting an
+    # already-overwhelmed broker's backlog grow without bound. See
+    # messaging/backpressure.py.
+    backpressure_max_queue_depth: int = 10000
+
     # ---- Retries ----
     # See domain/retry_policy.py for how these combine.
     retry_base_delay_seconds: float = 1.0
