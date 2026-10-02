@@ -60,6 +60,20 @@ class Settings(BaseSettings):
     # before giving up on them and closing connections anyway.
     worker_shutdown_grace_period_seconds: int = 30
 
+    # ---- Priority scheduling (Phase 15) ----
+    # Relative weights for scheduling/priority_scheduler.py's
+    # Smooth Weighted Round-Robin selector -- see its module
+    # docstring for why these are weights (proportional share), not
+    # a strict ordering.
+    priority_weight_high: int = 4
+    priority_weight_normal: int = 2
+    priority_weight_low: int = 1
+    # How long the dispatch loop sleeps when every priority queue
+    # came up empty on the same turn, before trying again -- avoids
+    # a tight busy-loop hammering RabbitMQ with empty polls when
+    # there's genuinely no work anywhere.
+    priority_poll_idle_sleep_seconds: float = 0.05
+
     # ---- Rate limiting and backpressure ----
     # Populated in Phase 14. Fixed-window counter in Redis: at most
     # rate_limit_requests_per_window POST /tasks calls per
