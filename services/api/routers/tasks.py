@@ -23,7 +23,10 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
 def _get_task_service(request: Request) -> TaskService:
-    return TaskService(request.app.state.publisher, request.app.state.cancellation_broadcaster)
+    # Phase 17: TaskService no longer needs a TaskPublisher -- every
+    # write path goes through the transactional outbox instead (see
+    # services/api/services/task_service.py's module docstring).
+    return TaskService(request.app.state.cancellation_broadcaster)
 
 
 async def _check_rate_limit(request: Request) -> None:

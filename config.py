@@ -96,6 +96,13 @@ class Settings(BaseSettings):
     scheduler_poll_interval_seconds: float = 1.0
     scheduler_batch_size: int = 50
 
+    # ---- Outbox relay (Phase 17) ----
+    # How often services/outbox_relay/main.py polls Postgres for
+    # unpublished outbox_messages rows, and how many it relays to
+    # RabbitMQ per poll. See docs/outbox.md.
+    outbox_relay_poll_interval_seconds: float = 0.5
+    outbox_relay_batch_size: int = 100
+
     # ---- Retries ----
     # See domain/retry_policy.py for how these combine.
     retry_base_delay_seconds: float = 1.0

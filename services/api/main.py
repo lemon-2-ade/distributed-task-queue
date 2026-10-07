@@ -41,6 +41,14 @@ Phase 14 adds a RateLimiter, checked (along with queue-depth
 backpressure, messaging/backpressure.py) at the top of
 POST /tasks -- see services/api/routers/tasks.py and
 docs/rate-limiting-and-backpressure.md.
+
+Phase 17 removes TaskPublisher from here: TaskService no longer
+publishes directly (see its module docstring) -- it writes to the
+transactional outbox instead, which services/outbox_relay/ drains.
+The API still owns a RabbitMQConnection (not a TaskPublisher) purely
+for /ready's connectivity check and POST /tasks's backpressure check
+(messaging/backpressure.py's queue-depth lookup), neither of which
+involves publishing a message.
 """
 
 from collections.abc import AsyncGenerator
@@ -54,7 +62,6 @@ from coordination.load_balancer import LeastLoadedStrategy, RoundRobinStrategy
 from coordination.rate_limiter import RateLimiter
 from coordination.worker_registry import WorkerRegistry
 from messaging.connection import RabbitMQConnection
-from messaging.publisher import TaskPublisher
 from services.api.routers import health, tasks, workers
 
 
@@ -63,7 +70,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     rabbitmq = RabbitMQConnection()
     await rabbitmq.connect()
     app.state.rabbitmq = rabbitmq
-    app.state.publisher = TaskPublisher(rabbitmq.task_exchange)
 
     app.state.worker_registry = WorkerRegistry()
     app.state.cancellation_broadcaster = CancellationBroadcaster()

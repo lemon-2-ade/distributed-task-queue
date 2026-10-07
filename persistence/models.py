@@ -16,12 +16,23 @@ answer "show me everything that happened to this task, in order" --
 GET /tasks/{id}/events. Both are written by
 persistence.state_manager.TaskStateManager alongside every status
 change, never directly by a route or the worker.
+
+Phase 17 adds `outbox_messages`: the transactional outbox. See
+docs/outbox.md for the full design -- in short, every place that
+used to write a Task status change *and then separately* call
+TaskPublisher.publish_task() (two operations, not atomic, the
+"dual-write problem" flagged throughout this codebase since Phase 5)
+now writes the status change *and* an OutboxMessage row in the exact
+same Postgres transaction instead. A separate process,
+services/outbox_relay/, is the only thing left that actually talks to
+RabbitMQ to publish -- it polls this table for unpublished rows and
+relays them.
 """
 
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -99,6 +110,56 @@ class TaskAttempt(Base):
         # "list every attempt for this task, in order" is the only
         # query shape this table needs to serve right now.
         Index("ix_task_attempts_task_id", "task_id"),
+    )
+
+
+class OutboxMessage(Base):
+    """
+    One row per "this task needs to be published to RabbitMQ."
+    Written in the same transaction as whatever Task status change
+    made that true (QUEUED, whether from immediate creation, a
+    scheduler claim, a manual retry, or an automatic retry), which is
+    the entire point: a transaction either commits both the status
+    change and the intent-to-publish together, or neither -- there is
+    no window where Postgres says QUEUED but nothing durable records
+    that a message still needs to reach RabbitMQ.
+
+    `published_at` is null until services/outbox_relay/relay.py
+    successfully hands this to RabbitMQ and marks it. It is never
+    deleted on success (kept as an audit trail of what was actually
+    relayed and when) -- this table is expected to be pruned by
+    retention tooling in a real deployment, not by application code,
+    the same stance this project takes on task_events never being
+    deleted either.
+    """
+
+    __tablename__ = "outbox_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=False
+    )
+    task_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    priority: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # The relay's entire query shape is "give me unpublished rows,
+        # oldest first" -- a partial index (only indexing the
+        # published_at IS NULL rows) keeps this index small and fast
+        # regardless of how many already-published rows have piled up
+        # over the system's lifetime, since those never need to be
+        # found by this query again.
+        Index(
+            "ix_outbox_messages_unpublished",
+            "created_at",
+            postgresql_where=text("published_at IS NULL"),
+        ),
     )
 
 

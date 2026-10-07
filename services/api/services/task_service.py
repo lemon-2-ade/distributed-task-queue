@@ -3,16 +3,26 @@ Task creation/read use cases -- the layer routers call into instead
 of touching the repository or messaging layer directly (see
 services/api/main.py's module docstring for why).
 
-Known, deliberate gap in this phase: create_task() writes the task
-row to PostgreSQL, commits, and *then* publishes to RabbitMQ as a
-second, separate operation. If this process dies between those two
-steps, the task exists in the database as PENDING forever but is
-never enqueued -- nothing will ever pick it up. This is the "dual-
-write problem" documented in docs/architecture.md. The correct fix
-is the Outbox Pattern (Phase 17): write the task *and* an outbox
-row in one transaction, and let a separate publisher process drain
-the outbox. That doesn't exist yet -- this version is left honestly
-imperfect so the Outbox phase is a visible fix, not a silent one.
+Phase 17 (Outbox Pattern) removes this service's direct dependency on
+TaskPublisher/RabbitMQ entirely. Through Phase 16, create_task() and
+retry_dead_lettered_task() each wrote a Task status change to
+Postgres, committed, and *then* called TaskPublisher.publish_task()
+as a second, separate operation -- the "dual-write problem"
+documented since Phase 5: a crash between those two steps left a task
+QUEUED in Postgres forever without ever reaching RabbitMQ, and
+nothing would ever pick it up.
+
+Both methods now write the status change *and* an OutboxMessage row
+(persistence/models.py) in the exact same Postgres transaction
+instead -- either both land, or neither does, so there is no window
+where Postgres says QUEUED but nothing durable records that a
+message still needs to reach RabbitMQ. A separate process,
+services/outbox_relay/, is the only thing that actually talks to
+RabbitMQ to publish now; this service doesn't need a TaskPublisher at
+all anymore. See docs/outbox.md for the full design and the new
+failure mode this trades the old one for (a possible duplicate
+publish, never a lost one -- handled by the idempotency machinery
+already in place since Phase 13).
 """
 
 import uuid
@@ -23,9 +33,9 @@ from sqlalchemy.exc import IntegrityError
 
 from coordination.cancellation import CancellationBroadcaster
 from domain.states import TaskPriority, TaskStatus
-from messaging.publisher import TaskPublisher
 from persistence.database import AsyncSessionLocal
 from persistence.models import Task, TaskEvent
+from persistence.repositories.outbox_repository import OutboxRepository
 from persistence.repositories.task_repository import TaskRepository
 from persistence.state_manager import TaskStateManager
 
@@ -38,10 +48,7 @@ _CANCELLABLE_STATUSES = {TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.RUNNI
 
 
 class TaskService:
-    def __init__(
-        self, publisher: TaskPublisher, cancellation_broadcaster: CancellationBroadcaster
-    ) -> None:
-        self._publisher = publisher
+    def __init__(self, cancellation_broadcaster: CancellationBroadcaster) -> None:
         self._cancellation_broadcaster = cancellation_broadcaster
 
     async def create_task(
@@ -65,13 +72,14 @@ class TaskService:
         method has to handle.
 
         Phase 16: a `scheduled_at` in the future means this task is
-        deliberately left PENDING and *not* published here -- it's
-        services/scheduler/main.py's job to notice (by polling
-        Postgres) once that time arrives, claim it, and publish it
-        then. A missing or already-past scheduled_at is "run now,"
-        unchanged from every phase before this one, and takes the
-        same immediate publish-and-transition-to-QUEUED path it
-        always has. See docs/scheduling.md.
+        deliberately left PENDING and *not* enqueued to the outbox
+        here -- it's services/scheduler/main.py's job to notice (by
+        polling Postgres) once that time arrives, claim it, and
+        enqueue it to the outbox then. A missing or already-past
+        scheduled_at is "run now," unchanged from every phase before
+        Phase 16, and takes the same immediate-QUEUED path it always
+        has -- just via the outbox (Phase 17) rather than a direct
+        publish. See docs/scheduling.md and docs/outbox.md.
         """
         if scheduled_at is not None and scheduled_at.tzinfo is None:
             # A client can send an ISO timestamp with no UTC offset
@@ -125,26 +133,25 @@ class TaskService:
                 raise  # genuinely unexpected: re-raise rather than hide it
 
         if scheduled_at is not None and scheduled_at > datetime.now(timezone.utc):
-            # Deferred: stays PENDING, nothing published. The
+            # Deferred: stays PENDING, nothing enqueued yet. The
             # scheduler's claim_due_scheduled_tasks() query is what
             # eventually picks this row up -- see
             # persistence/repositories/task_repository.py.
             return task, True
 
-        # Run now (no scheduled_at, or one already in the past). See
-        # module docstring: this publish is not part of the
-        # transaction above. A crash right here is the dual-write
-        # problem in action.
-        await self._publisher.publish_task(
-            task_id=task.task_id,
-            task_type=task.task_type,
-            payload=task.payload,
-            priority=priority,
-        )
-
+        # Run now (no scheduled_at, or one already in the past): the
+        # QUEUED transition and the outbox row are written together,
+        # in one transaction -- see this module's docstring.
         async with AsyncSessionLocal() as session:
             state_manager = TaskStateManager(session)
+            outbox_repo = OutboxRepository(session)
             queued_task = await state_manager.transition(task.task_id, TaskStatus.QUEUED)
+            await outbox_repo.enqueue(
+                task_id=queued_task.task_id,
+                task_type=queued_task.task_type,
+                payload=queued_task.payload,
+                priority=priority,
+            )
             await session.commit()
         return queued_task, True
 
@@ -165,7 +172,9 @@ class TaskService:
         domain/states/transitions.py for why that's the one allowed
         exception to "terminal means terminal." Resets retry_count to
         0, since this is a deliberate fresh start, not a continuation
-        of the automatic retry sequence that already gave up.
+        of the automatic retry sequence that already gave up. The
+        QUEUED transition and the outbox row are written in the same
+        transaction, same as create_task() above.
         """
         async with AsyncSessionLocal() as session:
             repo = TaskRepository(session)
@@ -178,32 +187,32 @@ class TaskService:
                     "dead-lettered tasks can be manually retried"
                 )
             state_manager = TaskStateManager(session)
+            outbox_repo = OutboxRepository(session)
             task = await state_manager.transition(
                 task_id,
                 TaskStatus.QUEUED,
                 retry_count=0,
                 event_metadata={"reason": "manual_admin_retry"},
             )
+            await outbox_repo.enqueue(
+                task_id=task.task_id,
+                task_type=task.task_type,
+                payload=task.payload,
+                priority=TaskPriority(task.priority),
+            )
             await session.commit()
-
-        await self._publisher.publish_task(
-            task_id=task.task_id,
-            task_type=task.task_type,
-            payload=task.payload,
-            priority=TaskPriority(task.priority),
-        )
         return task
 
     async def cancel_task(self, task_id: uuid.UUID) -> Task | None:
         """
         PENDING/QUEUED: nothing is executing yet, so this can
         transition straight to CANCELLED here and now -- no worker
-        involvement needed. The message already published to
-        RabbitMQ (if any) can't be recalled, but
-        services/worker/consumer.py's RUNNING-transition handling
-        catches exactly this case (InvalidStateTransitionError,
-        since the task is no longer QUEUED by the time that delivery
-        is processed) and just acks it without running anything.
+        involvement needed. A message already published to RabbitMQ
+        (if any) can't be recalled, but services/worker/consumer.py's
+        RUNNING-transition handling catches exactly this case
+        (InvalidStateTransitionError, since the task is no longer
+        QUEUED by the time that delivery is processed) and just acks
+        it without running anything.
 
         RUNNING: a worker somewhere already has this task's handler
         executing. This process has no direct line to that worker --

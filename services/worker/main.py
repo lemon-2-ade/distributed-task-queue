@@ -17,9 +17,12 @@ Phase 5's single-task-at-a-time worker:
   the *concurrency* WORKER_CONCURRENCY gives within one process --
   see docs/concurrency.md for why those are not the same thing and
   why this project doesn't claim otherwise.
-- Retries (Phase 8) republish through this same worker's own
-  TaskPublisher, on the same connection/channel it consumes with --
-  see services/worker/consumer.py for the retry flow itself.
+- Retries (Phase 8) republish for their next attempt -- through
+  Phase 16 that meant this worker's own TaskPublisher, on the same
+  connection/channel it consumes with; Phase 17 replaces that with a
+  transactional outbox row instead (see services/worker/consumer.py
+  and docs/outbox.md), so this process no longer publishes to
+  RabbitMQ directly at all, only consumes from it.
 
 Phase 10 adds the worker registry (coordination/worker_registry.py):
 this worker registers itself in Redis on startup, refreshes that
@@ -72,7 +75,6 @@ from coordination.heartbeat import run_heartbeat_loop
 from coordination.worker_registry import WorkerRegistry
 from domain.states import TaskPriority
 from messaging.connection import RabbitMQConnection
-from messaging.publisher import TaskPublisher
 from messaging.queues import DEAD_LETTER_QUEUE, QUEUE_BY_PRIORITY
 from scheduling.priority_scheduler import WeightedQueueSelector
 from services.worker.consumer import MessageHandler, make_dlq_handler, make_message_handler
@@ -169,10 +171,12 @@ async def main() -> None:
 
     registry = WorkerRegistry()
 
-    publisher = TaskPublisher(rabbitmq.task_exchange)
-    message_handler = make_message_handler(
-        WORKER_ID, settings.worker_concurrency, publisher, registry
-    )
+    # Phase 17: no TaskPublisher constructed here anymore -- retries
+    # republish via the transactional outbox now (see
+    # services/worker/consumer.py), not a direct publish from this
+    # process. This worker still needs `rabbitmq` for consuming the
+    # priority/DLQ queues, just never for publishing.
+    message_handler = make_message_handler(WORKER_ID, settings.worker_concurrency, registry)
 
     queue_names = list(QUEUE_BY_PRIORITY.values())
     priority_queues = {

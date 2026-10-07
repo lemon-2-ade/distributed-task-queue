@@ -1,6 +1,6 @@
 # Phase 2 added `api`, Phase 5 adds `worker`, Phase 16 adds
-# `scheduler`, on top of the Phase 1 infrastructure (postgres,
-# rabbitmq, redis).
+# `scheduler`, Phase 17 adds `outbox_relay`, on top of the Phase 1
+# infrastructure (postgres, rabbitmq, redis).
 name: distributed-task-queue
 
 services:
@@ -106,8 +106,20 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  outbox_relay:
+    build:
+      context: .
+      dockerfile: docker/outbox-relay.Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
       RABBITMQ_URL: ${RABBITMQ_URL}
-      REDIS_URL: ${REDIS_URL}
     depends_on:
       postgres:
         condition: service_healthy

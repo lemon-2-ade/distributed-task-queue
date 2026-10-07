@@ -24,7 +24,8 @@ follows from that one sentence:
 | **RabbitMQ messaging layer** | The exchange/queue/routing-key topology, publisher, and consumer wrappers. Owns delivery guarantees (ack/nack, redelivery, DLQ). |
 | **Worker service** | An independently deployable process that consumes messages, executes task handlers, reports state back to PostgreSQL, and reports liveness to Redis. |
 | **Worker Registry** | Redis-backed record of which workers exist, their capacity/load, and whether their heartbeat is current. |
-| **Scheduler** | Polls PostgreSQL for tasks whose `scheduled_at` has arrived, atomically claims them, and publishes them — safe to run as multiple replicas. |
+| **Scheduler** | Polls PostgreSQL for tasks whose `scheduled_at` has arrived, atomically claims them, and enqueues them to the Outbox — safe to run as multiple replicas. |
+| **Outbox Relay** | The only process that publishes to RabbitMQ. Polls PostgreSQL's `outbox_messages` table for unpublished rows (written atomically alongside every status change that needs a message sent) and relays them — safe to run as multiple replicas. See `docs/outbox.md`. |
 | **PostgreSQL persistence layer** | System of record: tasks, attempts, events, idempotency keys, outbox. |
 | **Redis coordination layer** | Ephemeral, fast-changing state: heartbeats, rate-limit counters, short-lived locks/leases. Never the system of record. |
 | **Load Balancing / Scheduling Strategy** | Application-level worker selection (round-robin, least-loaded) — distinct from RabbitMQ's own consumer dispatch, see below. |

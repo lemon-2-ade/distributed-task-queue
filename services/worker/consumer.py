@@ -19,9 +19,11 @@ Retries (Phase 8): a handler failure is one of two things --
    max_retries`, the task goes FAILED -> RETRYING (recording the
    attempt and incrementing retry_count), this worker sleeps for a
    jittered exponential backoff (domain/retry_policy.py), then
-   RETRYING -> QUEUED and a *new* message is published for the next
-   attempt -- only then is the *original* message acked. If retries
-   are exhausted, the task stays FAILED and the original message is
+   RETRYING -> QUEUED with an outbox row enqueued for the next
+   attempt in the same transaction (Phase 17 -- see docs/outbox.md;
+   through Phase 16 this was a direct RabbitMQ publish instead) --
+   only then is the *original* message acked. If retries are
+   exhausted, the task stays FAILED and the original message is
    nacked with requeue=False, which (via the dead-letter-exchange
    argument on every priority queue) sends it to the DLQ. Nothing
    marks it DEAD_LETTERED yet -- Phase 9 adds a consumer that
@@ -108,9 +110,9 @@ from coordination.worker_registry import WorkerRegistry
 from domain.exceptions import InvalidStateTransitionError, PermanentTaskError
 from domain.retry_policy import compute_backoff_seconds
 from domain.states import TaskPriority, TaskStatus
-from messaging.publisher import TaskPublisher
 from persistence.database import AsyncSessionLocal
 from persistence.models import Task
+from persistence.repositories.outbox_repository import OutboxRepository
 from persistence.state_manager import TaskStateManager
 from task_handlers import TASK_HANDLERS
 
@@ -126,11 +128,8 @@ class MessageHandler:
     wait_for_drain() during graceful shutdown).
     """
 
-    def __init__(
-        self, worker_id: str, concurrency: int, publisher: TaskPublisher, registry: WorkerRegistry
-    ) -> None:
+    def __init__(self, worker_id: str, concurrency: int, registry: WorkerRegistry) -> None:
         self.worker_id = worker_id
-        self._publisher = publisher
         self._registry = registry
         self._semaphore = asyncio.Semaphore(concurrency)
         self._settings = get_settings()
@@ -273,7 +272,6 @@ class MessageHandler:
                         priority=priority,
                         error=TimeoutError(f"task exceeded its {task.timeout}s timeout"),
                         failure_status=TaskStatus.TIMEOUT,
-                        publisher=self._publisher,
                         settings=self._settings,
                     )
                     return
@@ -301,7 +299,6 @@ class MessageHandler:
                         priority=priority,
                         error=exc,
                         failure_status=TaskStatus.FAILED,
-                        publisher=self._publisher,
                         settings=self._settings,
                     )
                     return
@@ -314,21 +311,23 @@ class MessageHandler:
                 await self._registry.decrement_load(self.worker_id)
 
 
-def make_message_handler(
-    worker_id: str, concurrency: int, publisher: TaskPublisher, registry: WorkerRegistry
-) -> MessageHandler:
+def make_message_handler(worker_id: str, concurrency: int, registry: WorkerRegistry) -> MessageHandler:
     """
     Returns a MessageHandler bound to this worker's id (recorded on
     every attempt), a concurrency limit of at most `concurrency`
-    handlers running at once, a `publisher` used to republish a task
-    for its next attempt after a transient failure, and a `registry`
-    used to report this worker's current load (Phase 11). Pass
-    `.handle` as the aio-pika consumer callback; keep the returned
-    object itself around too, for `.cancel_task()` (Phase 12
-    cancellation) and `.wait_for_drain()` (Phase 12 graceful
-    shutdown) -- see services/worker/main.py.
+    handlers running at once, and a `registry` used to report this
+    worker's current load (Phase 11). Pass `.handle` as the aio-pika
+    consumer callback; keep the returned object itself around too,
+    for `.cancel_task()` (Phase 12 cancellation) and
+    `.wait_for_drain()` (Phase 12 graceful shutdown) -- see
+    services/worker/main.py.
+
+    Phase 17: no TaskPublisher here anymore -- a transient-failure
+    retry's republish goes through the transactional outbox now (see
+    _handle_terminal_failure below), not a direct RabbitMQ publish
+    call from this process.
     """
-    return MessageHandler(worker_id, concurrency, publisher, registry)
+    return MessageHandler(worker_id, concurrency, registry)
 
 
 async def _handle_terminal_failure(
@@ -340,7 +339,6 @@ async def _handle_terminal_failure(
     priority: TaskPriority,
     error: Exception,
     failure_status: TaskStatus,
-    publisher: TaskPublisher,
     settings,
 ) -> None:
     """
@@ -380,15 +378,24 @@ async def _handle_terminal_failure(
 
     await asyncio.sleep(delay_seconds)
 
-    await _transition(task_id, TaskStatus.QUEUED)
-    await publisher.publish_task(
-        task_id=task_id, task_type=task_type, payload=payload, priority=priority
+    # Phase 17: the QUEUED transition and the outbox row that makes
+    # this retry actually get republished are written in the same
+    # Postgres transaction -- see
+    # _transition_to_queued_and_enqueue_outbox below, and
+    # docs/outbox.md for why this replaced a direct
+    # publisher.publish_task() call here.
+    await _transition_to_queued_and_enqueue_outbox(
+        task_id, task_type=task_type, payload=payload, priority=priority
     )
     # Only now: the original message's work (recording the failure
-    # and publishing its replacement) is durably done, so it's safe
-    # to ack it. Acking earlier and then crashing mid-backoff-sleep
-    # would silently lose the retry -- the same "why ACK timing
-    # matters" reasoning as the success path.
+    # and durably recording its replacement's intent-to-publish) is
+    # done, so it's safe to ack it. Acking earlier and then crashing
+    # mid-backoff-sleep would silently lose the retry -- the same
+    # "why ACK timing matters" reasoning as the success path. Note
+    # this no longer depends on RabbitMQ actually being reachable at
+    # this instant: the outbox row is the durable commitment, not the
+    # publish itself (services/outbox_relay/ handles that separately
+    # and can retry it independently of this worker).
     await message.ack()
 
 
@@ -396,6 +403,20 @@ async def _transition(task_id: uuid.UUID, to_status: TaskStatus, **kwargs: objec
     async with AsyncSessionLocal() as session:
         state_manager = TaskStateManager(session)
         task = await state_manager.transition(task_id, to_status, **kwargs)
+        await session.commit()
+        return task
+
+
+async def _transition_to_queued_and_enqueue_outbox(
+    task_id: uuid.UUID, *, task_type: str, payload: dict, priority: TaskPriority
+) -> Task:
+    async with AsyncSessionLocal() as session:
+        state_manager = TaskStateManager(session)
+        outbox_repo = OutboxRepository(session)
+        task = await state_manager.transition(task_id, TaskStatus.QUEUED)
+        await outbox_repo.enqueue(
+            task_id=task_id, task_type=task_type, payload=payload, priority=priority
+        )
         await session.commit()
         return task
 

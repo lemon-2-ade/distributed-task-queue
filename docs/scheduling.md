@@ -93,25 +93,26 @@ nobody double-delivers) -- just solved at the Postgres row level
 instead of the message-broker level, because the thing being
 competed for here is rows in a table, not messages on a queue.
 
-## Why the claim and the publish are two separate steps
+## Why claiming writes an outbox row instead of publishing directly
 
 `services/scheduler/dispatcher.py`'s `claim_and_dispatch_due_tasks`
-claims, transitions to `QUEUED`, and commits -- *then* publishes to
-RabbitMQ as a second, separate operation. This is the same
-dual-write problem documented throughout this project
-(`docs/architecture.md`, every phase's create/retry path) and not
-a new failure mode invented for scheduling specifically: a crash
-between the commit and the publish leaves a task `QUEUED` in
-Postgres that was never actually enqueued in RabbitMQ, and nothing
-will pick it up. The commit has to happen first and separately
-*because* it's also what releases the `FOR UPDATE SKIP LOCKED`
-row locks -- holding the transaction open across the RabbitMQ
-publish call (to make the whole thing "atomic") would mean every
-other scheduler replica stays blocked on those locks for as long as
-the publish takes, turning a few-millisecond Postgres transaction
-into one gated by network I/O to a different system entirely. The
-real fix for the underlying dual-write gap is the Outbox Pattern
-(Phase 17), not held-open transactions here.
+claims, transitions to `QUEUED`, and -- as of Phase 17 -- writes an
+`outbox_messages` row, all in the one transaction that commit
+releases the `FOR UPDATE SKIP LOCKED` row locks for. It does **not**
+publish to RabbitMQ itself; `services/outbox_relay/` does that
+separately, on its own schedule. Earlier phases (through Phase 16)
+had this function publish directly after committing -- a second,
+separate operation vulnerable to the same dual-write problem
+documented throughout this project (`docs/architecture.md`): a crash
+between the commit and the publish would leave a task `QUEUED` in
+Postgres that was never actually enqueued in RabbitMQ, with nothing
+left to pick it up. Deferring the actual publish to the outbox is
+what closes that gap -- see `docs/outbox.md` for the full design. It
+also means this function never has to choose between holding its
+Postgres transaction open across a RabbitMQ network call (blocking
+every other scheduler replica on these same row locks for as long as
+that call takes) and accepting the dual-write risk -- it does
+neither, because publishing isn't this function's problem anymore.
 
 ## Failure modes
 
@@ -120,10 +121,12 @@ real fix for the underlying dual-write gap is the Outbox Pattern
   comes back and polls them -- nothing is lost, just delayed. This
   is the same durability guarantee every other `PENDING` task in
   this system already has (Postgres is the source of truth).
-- **Crash between commit and publish** (see above): a task stuck
-  `QUEUED` in Postgres but never delivered to RabbitMQ. Outstanding
-  until Phase 17's Outbox Pattern, same as every other instance of
-  this gap in the codebase.
+- **Crash after this function's commit, before the outbox relay
+  publishes**: not a problem -- the outbox row is already durably
+  committed at that point, and `services/outbox_relay/` will find and
+  relay it on its own schedule, independent of whether the scheduler
+  process that wrote it is still running. See `docs/outbox.md` for
+  the (different, and accepted) failure mode this introduces instead.
 - **Clock skew between the API host and the database**: `scheduled_at`
   comparisons use Postgres's own clock (the query's `<= now` bound is
   computed in the scheduler process and sent as a parameter -- see

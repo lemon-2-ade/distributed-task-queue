@@ -1,5 +1,6 @@
 """
-Scheduler process entrypoint (Phase 16).
+Scheduler process entrypoint (Phase 16; Phase 17 drops its RabbitMQ
+dependency entirely).
 
 A third standalone, independently deployable process alongside the
 API and worker (see services/worker/main.py's module docstring for
@@ -27,30 +28,27 @@ see docs/scheduling.md for the explicit disambiguation.
 This process has no per-message work to drain on shutdown the way a
 worker does (services/worker/main.py's wait_for_drain) -- a poll
 cycle either hasn't started (nothing to wait for) or has already
-committed its claims to Postgres and is about to publish them (see
-dispatcher.py's module docstring for why that specific ordering
-matters). SIGTERM here just stops the loop from starting another
-cycle; it does not interrupt a cycle already in progress, since a
-cycle's Postgres work is already a complete, committed unit by the
-time anything could be interrupted.
+committed as a complete unit by the time anything could be
+interrupted (see dispatcher.py). SIGTERM here just stops the loop
+from starting another cycle.
+
+Phase 17 removes this process's RabbitMQConnection/TaskPublisher
+entirely: claiming a due task now ends with writing an outbox row
+(in the same Postgres transaction as the QUEUED status change) rather
+than publishing directly -- see dispatcher.py and docs/outbox.md.
+This process is Postgres-only now; services/outbox_relay/ is the only
+thing left that connects to RabbitMQ to actually publish.
 """
 
 import asyncio
 import signal
 
 from config import get_settings
-from messaging.connection import RabbitMQConnection
-from messaging.publisher import TaskPublisher
 from services.scheduler.dispatcher import claim_and_dispatch_due_tasks
 
 
 async def main() -> None:
     settings = get_settings()
-
-    rabbitmq = RabbitMQConnection()
-    await rabbitmq.connect()
-
-    publisher = TaskPublisher(rabbitmq.task_exchange)
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -64,9 +62,7 @@ async def main() -> None:
     )
 
     while not stop_event.is_set():
-        dispatched = await claim_and_dispatch_due_tasks(
-            publisher, limit=settings.scheduler_batch_size
-        )
+        dispatched = await claim_and_dispatch_due_tasks(limit=settings.scheduler_batch_size)
         if dispatched:
             print(f"[scheduler] dispatched {dispatched} due task(s)", flush=True)
 
@@ -77,9 +73,7 @@ async def main() -> None:
         except asyncio.TimeoutError:
             pass
 
-    print("[scheduler] shutdown signal received", flush=True)
-    await rabbitmq.close()
-    print("[scheduler] stopped", flush=True)
+    print("[scheduler] shutdown signal received, stopped", flush=True)
 
 
 if __name__ == "__main__":
