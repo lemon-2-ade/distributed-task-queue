@@ -78,6 +78,7 @@ async def create_task(body: TaskCreateRequest, request: Request, response: Respo
         max_retries=body.max_retries,
         timeout=body.timeout,
         idempotency_key=body.idempotency_key,
+        scheduled_at=body.scheduled_at,
     )
     response.status_code = status.HTTP_201_CREATED if was_created else status.HTTP_200_OK
     return TaskResponse.model_validate(task)

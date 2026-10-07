@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     # messaging/backpressure.py.
     backpressure_max_queue_depth: int = 10000
 
+    # ---- Scheduler (Phase 16) ----
+    # How often services/scheduler/main.py polls Postgres for PENDING
+    # tasks whose scheduled_at has arrived, and how many it claims
+    # per poll. See docs/scheduling.md.
+    scheduler_poll_interval_seconds: float = 1.0
+    scheduler_batch_size: int = 50
+
     # ---- Retries ----
     # See domain/retry_policy.py for how these combine.
     retry_base_delay_seconds: float = 1.0

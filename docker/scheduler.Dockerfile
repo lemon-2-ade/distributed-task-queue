@@ -1,5 +1,5 @@
-# Phase 5: worker service image. Same rationale as docker/api.Dockerfile
-# for keeping one Dockerfile per service.
+# Phase 16: scheduler service image. Same one-Dockerfile-per-service
+# rationale as docker/api.Dockerfile and docker/worker.Dockerfile.
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -16,12 +16,10 @@ COPY domain ./domain
 COPY messaging ./messaging
 COPY persistence ./persistence
 COPY coordination ./coordination
-COPY scheduling ./scheduling
 COPY observability ./observability
-COPY task_handlers ./task_handlers
-COPY services/worker ./services/worker
+COPY services/scheduler ./services/scheduler
 COPY services/__init__.py ./services/__init__.py
 
 RUN pip install --no-cache-dir .
 
-CMD ["python", "-m", "services.worker.main"]
+CMD ["python", "-m", "services.scheduler.main"]

@@ -16,6 +16,7 @@ imperfect so the Outbox phase is a visible fix, not a silent one.
 """
 
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -52,6 +53,7 @@ class TaskService:
         max_retries: int,
         timeout: int | None,
         idempotency_key: str | None,
+        scheduled_at: datetime | None = None,
     ) -> tuple[Task, bool]:
         """
         Returns (task, was_created). was_created=False means an
@@ -61,7 +63,27 @@ class TaskService:
         itself, distinct from the worker-side redelivery dedup in
         services/worker/consumer.py) and the two distinct races this
         method has to handle.
+
+        Phase 16: a `scheduled_at` in the future means this task is
+        deliberately left PENDING and *not* published here -- it's
+        services/scheduler/main.py's job to notice (by polling
+        Postgres) once that time arrives, claim it, and publish it
+        then. A missing or already-past scheduled_at is "run now,"
+        unchanged from every phase before this one, and takes the
+        same immediate publish-and-transition-to-QUEUED path it
+        always has. See docs/scheduling.md.
         """
+        if scheduled_at is not None and scheduled_at.tzinfo is None:
+            # A client can send an ISO timestamp with no UTC offset
+            # (Pydantic parses that as a naive datetime). Rather than
+            # reject it or silently compare naive-vs-aware below
+            # (which raises TypeError), treat an offset-less
+            # scheduled_at as already being UTC -- the same
+            # convention every other timestamp in this system uses
+            # (see persistence/state_manager.py's datetime.utcnow()
+            # calls, and Task.created_at's server_default=func.now()).
+            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+
         if idempotency_key is not None:
             async with AsyncSessionLocal() as session:
                 repo = TaskRepository(session)
@@ -78,6 +100,7 @@ class TaskService:
                 priority=priority,
                 max_retries=max_retries,
                 timeout=timeout,
+                scheduled_at=scheduled_at,
                 idempotency_key=idempotency_key,
             )
             await state_manager.record_creation(task)
@@ -101,7 +124,15 @@ class TaskService:
                     return existing, False
                 raise  # genuinely unexpected: re-raise rather than hide it
 
-        # See module docstring: this publish is not part of the
+        if scheduled_at is not None and scheduled_at > datetime.now(timezone.utc):
+            # Deferred: stays PENDING, nothing published. The
+            # scheduler's claim_due_scheduled_tasks() query is what
+            # eventually picks this row up -- see
+            # persistence/repositories/task_repository.py.
+            return task, True
+
+        # Run now (no scheduled_at, or one already in the past). See
+        # module docstring: this publish is not part of the
         # transaction above. A crash right here is the dual-write
         # problem in action.
         await self._publisher.publish_task(

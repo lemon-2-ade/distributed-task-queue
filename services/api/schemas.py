@@ -17,6 +17,12 @@ class TaskCreateRequest(BaseModel):
     max_retries: int = 3
     timeout: int | None = None
     idempotency_key: str | None = None
+    # Phase 16: a future scheduled_at defers publishing -- the task
+    # is created but left PENDING instead of being queued/published
+    # immediately, until services/scheduler/main.py claims it once
+    # this time arrives. None (the default) or a past timestamp both
+    # mean "run now," matching every phase before this one.
+    scheduled_at: datetime | None = None
 
 
 class TaskResponse(BaseModel):

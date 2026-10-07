@@ -6,9 +6,11 @@ Why a repository at all, instead of calling the ORM session directly
 from the service layer: it gives every other layer (API routes,
 worker, scheduler, CLI) one place to depend on for "how do I read/
 write a task," so a later change (e.g. adding row-level locking to
-`get_due_tasks` for the scheduler in Phase 16) touches one file
-instead of every call site.
+claim_due_scheduled_tasks for the scheduler in Phase 16) touches one
+file instead of every call site.
 """
+
+from __future__ import annotations
 
 import uuid
 from datetime import datetime
@@ -68,6 +70,46 @@ class TaskRepository:
         stmt = select(Task).order_by(Task.created_at.desc()).limit(limit).offset(offset)
         if status is not None:
             stmt = stmt.where(Task.status == status.value)
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def claim_due_scheduled_tasks(self, *, now: datetime, limit: int = 50) -> list[Task]:
+        """
+        Phase 16: the core of safe multi-replica scheduling. Selects
+        PENDING tasks whose scheduled_at has arrived, *locking* each
+        matching row (`FOR UPDATE`) for the rest of this transaction
+        -- and `SKIP LOCKED` means a second scheduler replica running
+        this exact same query concurrently doesn't block waiting for
+        those locks, it just silently excludes whatever the first
+        replica already has locked and returns whatever's left. Two
+        schedulers can run this query at the same instant against an
+        overlapping set of due tasks and are *guaranteed* to walk away
+        with disjoint result sets -- neither has to know the other
+        exists, there's no separate lock/lease to coordinate, and
+        nothing here can double-claim a task. This is the standard
+        Postgres pattern for "many workers competing to claim rows
+        from one table" (the same shape of problem RabbitMQ's own
+        consumer dispatch solves at the message-broker level -- this
+        is what solves it at the row level).
+
+        Returns the matching Task ORM objects, still locked, within
+        the caller's existing session/transaction. Nothing is marked
+        QUEUED here -- see services/scheduler/dispatcher.py, which
+        transitions each one (via TaskStateManager, for the usual
+        event/attempt bookkeeping) and commits, which is what actually
+        releases these locks.
+        """
+        stmt = (
+            select(Task)
+            .where(
+                Task.status == TaskStatus.PENDING.value,
+                Task.scheduled_at.is_not(None),
+                Task.scheduled_at <= now,
+            )
+            .order_by(Task.scheduled_at.asc())
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
