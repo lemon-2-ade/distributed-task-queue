@@ -111,12 +111,15 @@ from coordination.worker_registry import WorkerRegistry
 from domain.exceptions import InvalidStateTransitionError, PermanentTaskError
 from domain.retry_policy import compute_backoff_seconds
 from domain.states import TaskPriority, TaskStatus
+from observability.tracing import get_tracer, inject_trace_context, start_span_from_carrier
 from persistence.database import AsyncSessionLocal
 from persistence.models import Task
 from persistence.repositories.outbox_repository import OutboxRepository
 from persistence.state_manager import TaskStateManager
 from services.worker.metrics import task_duration_seconds, tasks_processed_total, worker_active_tasks
 from task_handlers import TASK_HANDLERS
+
+_tracer = get_tracer(__name__)
 
 
 class MessageHandler:
@@ -198,140 +201,145 @@ class MessageHandler:
             await self._registry.increment_load(self.worker_id)
             worker_active_tasks.inc()
             try:
-                try:
-                    task = await _transition(task_id, TaskStatus.RUNNING, worker_id=self.worker_id)
-                except ValueError:
-                    # No matching task row: a stray or duplicate-delivered
-                    # message referencing a task we don't know about.
-                    await message.nack(requeue=False)
-                    return
-                except InvalidStateTransitionError as exc:
-                    # The task exists but isn't QUEUED/PENDING any
-                    # more by the time this delivery arrived. Two
-                    # genuinely different situations share this
-                    # exception, distinguished by exc.from_status
-                    # (Phase 13 -- see docs/idempotency.md):
-                    if exc.from_status == TaskStatus.RUNNING:
-                        # A RabbitMQ redelivery for a task that's
-                        # *already* RUNNING -- the exact scenario
-                        # docs/rabbitmq.md warns about: a consumer
-                        # can crash before acking, and the broker
-                        # redelivers. This worker (or another one)
-                        # already has -- or recently had -- this
-                        # task's handler running. Re-running it here
-                        # risks a non-idempotent handler's side
-                        # effects happening twice; silently dropping
-                        # it risks losing the only copy of the work
-                        # if the *original* attempt is the one that's
-                        # actually dead. This project doesn't have a
-                        # fencing/lease mechanism to tell those two
-                        # cases apart (a real gap, not a solved
-                        # problem -- see docs/idempotency.md), so it
-                        # takes the side that never silently
-                        # double-executes: record the duplicate for
-                        # visibility and discard this delivery. If
-                        # the original attempt really did die, the
-                        # task is left visibly stuck at RUNNING --
-                        # recoverable via the admin
-                        # POST /tasks/{id}/cancel endpoint Phase 12
-                        # already built, not by this consumer
-                        # guessing.
-                        await _record_duplicate_delivery(
-                            task_id, event_metadata={"worker_id": self.worker_id}
+                with start_span_from_carrier(
+                    _tracer, f"worker.execute_task.{task_type}", message.headers
+                ) as span:
+                    span.set_attribute("task.id", str(task_id))
+                    span.set_attribute("task.type", task_type)
+                    try:
+                        task = await _transition(task_id, TaskStatus.RUNNING, worker_id=self.worker_id)
+                    except ValueError:
+                        # No matching task row: a stray or duplicate-delivered
+                        # message referencing a task we don't know about.
+                        await message.nack(requeue=False)
+                        return
+                    except InvalidStateTransitionError as exc:
+                        # The task exists but isn't QUEUED/PENDING any
+                        # more by the time this delivery arrived. Two
+                        # genuinely different situations share this
+                        # exception, distinguished by exc.from_status
+                        # (Phase 13 -- see docs/idempotency.md):
+                        if exc.from_status == TaskStatus.RUNNING:
+                            # A RabbitMQ redelivery for a task that's
+                            # *already* RUNNING -- the exact scenario
+                            # docs/rabbitmq.md warns about: a consumer
+                            # can crash before acking, and the broker
+                            # redelivers. This worker (or another one)
+                            # already has -- or recently had -- this
+                            # task's handler running. Re-running it here
+                            # risks a non-idempotent handler's side
+                            # effects happening twice; silently dropping
+                            # it risks losing the only copy of the work
+                            # if the *original* attempt is the one that's
+                            # actually dead. This project doesn't have a
+                            # fencing/lease mechanism to tell those two
+                            # cases apart (a real gap, not a solved
+                            # problem -- see docs/idempotency.md), so it
+                            # takes the side that never silently
+                            # double-executes: record the duplicate for
+                            # visibility and discard this delivery. If
+                            # the original attempt really did die, the
+                            # task is left visibly stuck at RUNNING --
+                            # recoverable via the admin
+                            # POST /tasks/{id}/cancel endpoint Phase 12
+                            # already built, not by this consumer
+                            # guessing.
+                            await _record_duplicate_delivery(
+                                task_id, event_metadata={"worker_id": self.worker_id}
+                            )
+                            tasks_processed_total.labels(
+                                task_type=task_type, outcome="duplicate_discarded"
+                            ).inc()
+                        # Otherwise: the task reached some other status
+                        # entirely by the time this arrived -- the clearest
+                        # case is an admin cancelling a PENDING/QUEUED task
+                        # (services/api/services/task_service.py) whose
+                        # message had already been published and can't be
+                        # recalled. See docs/timeouts-and-cancellation.md.
+                        await message.ack()
+                        return
+
+                    handler = TASK_HANDLERS.get(task_type)
+                    if handler is None:
+                        await _transition(
+                            task_id,
+                            TaskStatus.FAILED,
+                            error=f"no handler registered for task_type={task_type!r}",
                         )
-                        tasks_processed_total.labels(
-                            task_type=task_type, outcome="duplicate_discarded"
-                        ).inc()
-                    # Otherwise: the task reached some other status
-                    # entirely by the time this arrived -- the clearest
-                    # case is an admin cancelling a PENDING/QUEUED task
-                    # (services/api/services/task_service.py) whose
-                    # message had already been published and can't be
-                    # recalled. See docs/timeouts-and-cancellation.md.
-                    await message.ack()
-                    return
+                        tasks_processed_total.labels(task_type=task_type, outcome="no_handler").inc()
+                        await message.nack(requeue=False)
+                        return
 
-                handler = TASK_HANDLERS.get(task_type)
-                if handler is None:
-                    await _transition(
-                        task_id,
-                        TaskStatus.FAILED,
-                        error=f"no handler registered for task_type={task_type!r}",
-                    )
-                    tasks_processed_total.labels(task_type=task_type, outcome="no_handler").inc()
-                    await message.nack(requeue=False)
-                    return
+                    handler_task = asyncio.ensure_future(handler(payload))
+                    self.running_tasks[task_id] = handler_task
+                    # Phase 18: timed from right before the handler
+                    # actually starts to whichever exit below is taken --
+                    # deliberately excludes everything before this point
+                    # (parsing, the RUNNING transition) and everything
+                    # after (acking, the terminal-state write), since
+                    # those are worker/infra overhead, not the handler's
+                    # own execution time. See services/worker/metrics.py.
+                    started_at = time.perf_counter()
+                    try:
+                        if task.timeout:
+                            result = await asyncio.wait_for(handler_task, timeout=task.timeout)
+                        else:
+                            result = await handler_task
+                    except asyncio.TimeoutError:
+                        # wait_for already cancelled handler_task for us.
+                        duration = time.perf_counter() - started_at
+                        await _handle_terminal_failure(
+                            message,
+                            task_id=task_id,
+                            task_type=task_type,
+                            payload=payload,
+                            priority=priority,
+                            error=TimeoutError(f"task exceeded its {task.timeout}s timeout"),
+                            failure_status=TaskStatus.TIMEOUT,
+                            settings=self._settings,
+                            duration_seconds=duration,
+                        )
+                        return
+                    except asyncio.CancelledError:
+                        # Only reached when *this* handler_task was the
+                        # thing cancelled (cancel_task(), driven by the
+                        # Pub/Sub listener in main.py) -- not when the
+                        # outer handle() task itself is cancelled by
+                        # worker shutdown, which doesn't touch
+                        # running_tasks at all. No retry: this is a
+                        # deliberate stop, not a failure.
+                        duration = time.perf_counter() - started_at
+                        task_duration_seconds.labels(task_type=task_type).observe(duration)
+                        tasks_processed_total.labels(task_type=task_type, outcome="cancelled").inc()
+                        await _transition(
+                            task_id,
+                            TaskStatus.CANCELLED,
+                            error="cancelled by administrator",
+                        )
+                        await message.ack()
+                        return
+                    except Exception as exc:
+                        duration = time.perf_counter() - started_at
+                        await _handle_terminal_failure(
+                            message,
+                            task_id=task_id,
+                            task_type=task_type,
+                            payload=payload,
+                            priority=priority,
+                            error=exc,
+                            failure_status=TaskStatus.FAILED,
+                            settings=self._settings,
+                            duration_seconds=duration,
+                        )
+                        return
+                    finally:
+                        self.running_tasks.pop(task_id, None)
 
-                handler_task = asyncio.ensure_future(handler(payload))
-                self.running_tasks[task_id] = handler_task
-                # Phase 18: timed from right before the handler
-                # actually starts to whichever exit below is taken --
-                # deliberately excludes everything before this point
-                # (parsing, the RUNNING transition) and everything
-                # after (acking, the terminal-state write), since
-                # those are worker/infra overhead, not the handler's
-                # own execution time. See services/worker/metrics.py.
-                started_at = time.perf_counter()
-                try:
-                    if task.timeout:
-                        result = await asyncio.wait_for(handler_task, timeout=task.timeout)
-                    else:
-                        result = await handler_task
-                except asyncio.TimeoutError:
-                    # wait_for already cancelled handler_task for us.
-                    duration = time.perf_counter() - started_at
-                    await _handle_terminal_failure(
-                        message,
-                        task_id=task_id,
-                        task_type=task_type,
-                        payload=payload,
-                        priority=priority,
-                        error=TimeoutError(f"task exceeded its {task.timeout}s timeout"),
-                        failure_status=TaskStatus.TIMEOUT,
-                        settings=self._settings,
-                        duration_seconds=duration,
-                    )
-                    return
-                except asyncio.CancelledError:
-                    # Only reached when *this* handler_task was the
-                    # thing cancelled (cancel_task(), driven by the
-                    # Pub/Sub listener in main.py) -- not when the
-                    # outer handle() task itself is cancelled by
-                    # worker shutdown, which doesn't touch
-                    # running_tasks at all. No retry: this is a
-                    # deliberate stop, not a failure.
                     duration = time.perf_counter() - started_at
                     task_duration_seconds.labels(task_type=task_type).observe(duration)
-                    tasks_processed_total.labels(task_type=task_type, outcome="cancelled").inc()
-                    await _transition(
-                        task_id,
-                        TaskStatus.CANCELLED,
-                        error="cancelled by administrator",
-                    )
+                    tasks_processed_total.labels(task_type=task_type, outcome="success").inc()
+                    await _transition(task_id, TaskStatus.SUCCESS, result=result)
                     await message.ack()
-                    return
-                except Exception as exc:
-                    duration = time.perf_counter() - started_at
-                    await _handle_terminal_failure(
-                        message,
-                        task_id=task_id,
-                        task_type=task_type,
-                        payload=payload,
-                        priority=priority,
-                        error=exc,
-                        failure_status=TaskStatus.FAILED,
-                        settings=self._settings,
-                        duration_seconds=duration,
-                    )
-                    return
-                finally:
-                    self.running_tasks.pop(task_id, None)
-
-                duration = time.perf_counter() - started_at
-                task_duration_seconds.labels(task_type=task_type).observe(duration)
-                tasks_processed_total.labels(task_type=task_type, outcome="success").inc()
-                await _transition(task_id, TaskStatus.SUCCESS, result=result)
-                await message.ack()
             finally:
                 worker_active_tasks.dec()
                 await self._registry.decrement_load(self.worker_id)
@@ -444,12 +452,29 @@ async def _transition(task_id: uuid.UUID, to_status: TaskStatus, **kwargs: objec
 async def _transition_to_queued_and_enqueue_outbox(
     task_id: uuid.UUID, *, task_type: str, payload: dict, priority: TaskPriority
 ) -> Task:
+    """
+    Phase 19: called from inside _handle_terminal_failure, itself
+    called from inside _handle()'s `with start_span_from_carrier(...)`
+    block (see MessageHandler._handle) -- so the span that extracted
+    this attempt's own trace context from the inbound message's
+    headers is still the *active* span on this call stack right now.
+    inject_trace_context() below therefore captures a child of that
+    same attempt's span, not a fresh trace: the retry's outbox row
+    carries the original trace forward, which is what lets every
+    attempt at a task show up nested under one Jaeger trace instead
+    of scattering across a new one per attempt. See this module's
+    docstring and observability/tracing.py.
+    """
     async with AsyncSessionLocal() as session:
         state_manager = TaskStateManager(session)
         outbox_repo = OutboxRepository(session)
         task = await state_manager.transition(task_id, TaskStatus.QUEUED)
         await outbox_repo.enqueue(
-            task_id=task_id, task_type=task_type, payload=payload, priority=priority
+            task_id=task_id,
+            task_type=task_type,
+            payload=payload,
+            priority=priority,
+            trace_context=inject_trace_context(),
         )
         await session.commit()
         return task
@@ -488,12 +513,29 @@ def make_dlq_handler():
         try:
             body = json.loads(message.body)
             task_id = uuid.UUID(body["task_id"])
+            task_type = body["task_type"]
         except Exception:
             # Can't identify which task this was -- nothing to mark,
             # nothing gained by leaving it in the DLQ forever either.
             await message.ack()
             return
 
+        # Phase 19: RabbitMQ's dead-letter-exchange routing preserves
+        # the original message's headers (it only *adds* the x-death
+        # array, never strips what was already there), so the trace
+        # context this task's last real attempt extracted is still
+        # here -- continuing it means "task was dead-lettered" shows
+        # up as the final child span on that same original trace,
+        # same as every retry attempt before it.
+        with start_span_from_carrier(
+            _tracer, f"worker.dead_letter.{task_type}", message.headers
+        ) as span:
+            span.set_attribute("task.id", str(task_id))
+            span.set_attribute("task.type", task_type)
+            await _handle_dlq_transition(task_id)
+        await message.ack()
+
+    async def _handle_dlq_transition(task_id: uuid.UUID) -> None:
         try:
             await _transition(
                 task_id,
@@ -512,7 +554,5 @@ def make_dlq_handler():
             # message is now stale and safe to discard, since the
             # task's real current state is correct without it.
             pass
-
-        await message.ack()
 
     return handle_dlq_message

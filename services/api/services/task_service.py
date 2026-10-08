@@ -23,6 +23,14 @@ all anymore. See docs/outbox.md for the full design and the new
 failure mode this trades the old one for (a possible duplicate
 publish, never a lost one -- handled by the idempotency machinery
 already in place since Phase 13).
+
+Phase 19: both enqueue() calls below also capture the current trace
+context (observability.tracing.inject_trace_context()) onto the
+outbox row. Because services/api/main.py instruments this whole
+FastAPI app, there's already an active HTTP-request span by the time
+either of these methods runs -- no span needs to be started here,
+only captured, so the trace that shows up in Jaeger for a task is
+rooted at the HTTP request that created or retried it.
 """
 
 import uuid
@@ -35,6 +43,7 @@ from coordination.cancellation import CancellationBroadcaster
 from domain.states import TaskPriority, TaskStatus
 from persistence.database import AsyncSessionLocal
 from persistence.models import Task, TaskEvent
+from observability.tracing import inject_trace_context
 from persistence.repositories.outbox_repository import OutboxRepository
 from persistence.repositories.task_repository import TaskRepository
 from persistence.state_manager import TaskStateManager
@@ -151,6 +160,7 @@ class TaskService:
                 task_type=queued_task.task_type,
                 payload=queued_task.payload,
                 priority=priority,
+                trace_context=inject_trace_context(),
             )
             await session.commit()
         return queued_task, True
@@ -199,6 +209,7 @@ class TaskService:
                 task_type=task.task_type,
                 payload=task.payload,
                 priority=TaskPriority(task.priority),
+                trace_context=inject_trace_context(),
             )
             await session.commit()
         return task

@@ -143,6 +143,20 @@ class OutboxMessage(Base):
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     priority: Mapped[str] = mapped_column(String(16), nullable=False)
 
+    # Phase 19: the W3C traceparent/tracestate pair captured from
+    # whatever span was active when this row was written (a request
+    # handler, a retry, or a scheduler dispatch -- see
+    # observability/tracing.py's inject_trace_context()). Nullable
+    # because rows written before this column existed, and rows
+    # written while tracing is disabled, legitimately have none --
+    # extract_trace_context() treats that the same as an empty dict,
+    # so the outbox relay and worker fall back to starting a fresh
+    # trace rather than erroring out. This is what lets a trace begun
+    # in the API/scheduler survive the gap between "written to
+    # Postgres" and "picked up by the outbox relay," where no Python
+    # call stack -- and so no contextvars-based propagation -- exists.
+    trace_context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

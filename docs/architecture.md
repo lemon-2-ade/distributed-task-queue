@@ -13,7 +13,7 @@ follows from that one sentence:
 - Workers have to **coordinate** (who's alive, who's overloaded, who's
   allowed to submit right now) without a shared process → Redis.
 - All of it has to be **observable**, because distributed failures are
-  invisible by default → Prometheus, Grafana, OpenTelemetry.
+  invisible by default → Prometheus, Grafana, OpenTelemetry/Jaeger.
 
 ## Components
 
@@ -31,7 +31,7 @@ follows from that one sentence:
 | **Load Balancing / Scheduling Strategy** | Application-level worker selection (round-robin, least-loaded) — distinct from RabbitMQ's own consumer dispatch, see below. |
 | **Retry Manager** | Computes backoff/jitter and decides retry vs. dead-letter. |
 | **Task State Manager** | Enforces the task state machine (see `docs/task-lifecycle.md`, added when the state machine is implemented). |
-| **Observability layer** | Metrics (Phase 18: each service exposes a Prometheus `/metrics` endpoint, scraped by the `prometheus` service and visualized in `grafana` -- see docs/metrics.md). Structured logging and OpenTelemetry tracing are later phases, not yet built. |
+| **Observability layer** | Metrics (Phase 18: each service exposes a Prometheus `/metrics` endpoint, scraped by the `prometheus` service and visualized in `grafana` -- see docs/metrics.md) and distributed tracing (Phase 19: OpenTelemetry spans exported via OTLP/gRPC to the `jaeger` service, propagated across RabbitMQ and the transactional outbox -- see docs/tracing.md). Structured logging is plain per-event log lines, already present since early phases. |
 | **CLI / admin dashboard** | Optional, later-phase conveniences layered on top of the API. |
 
 ## RabbitMQ dispatch vs. application-level load balancing

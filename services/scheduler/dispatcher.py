@@ -13,17 +13,27 @@ for why that matters (committing is what releases the locks for the
 next scheduler replica). services/outbox_relay/ is now the only
 process that ever talks to RabbitMQ to publish; this process is
 Postgres-only.
+
+Phase 19: a scheduled task has no inbound HTTP request to inherit a
+trace from (unlike services/api/services/task_service.py's
+create_task()), so this is one of this system's two trace roots (the
+other being a client's POST /tasks call) -- each claimed due task
+gets its own fresh span here, named per task_type, whose context is
+what gets captured onto that task's outbox row.
 """
 
 import time
 from datetime import datetime, timezone
 
 from domain.states import TaskPriority, TaskStatus
+from observability.tracing import get_tracer, inject_trace_context
 from persistence.database import AsyncSessionLocal
 from persistence.repositories.outbox_repository import OutboxRepository
 from persistence.repositories.task_repository import TaskRepository
 from persistence.state_manager import TaskStateManager
 from services.scheduler.metrics import scheduler_dispatched_total, scheduler_poll_duration_seconds
+
+_tracer = get_tracer(__name__)
 
 
 async def claim_and_dispatch_due_tasks(*, limit: int) -> int:
@@ -47,20 +57,31 @@ async def claim_and_dispatch_due_tasks(*, limit: int) -> int:
 
         claimed = []
         for task in due_tasks:
-            queued_task = await state_manager.transition(
-                task.task_id,
-                TaskStatus.QUEUED,
-                event_metadata={
-                    "reason": "scheduled_at_due",
-                    "scheduled_at": task.scheduled_at.isoformat(),
-                },
-            )
-            await outbox_repo.enqueue(
-                task_id=queued_task.task_id,
-                task_type=queued_task.task_type,
-                payload=queued_task.payload,
-                priority=TaskPriority(queued_task.priority),
-            )
+            # Fresh trace root per task -- see this module's
+            # docstring. Span name carries the task_type (not the
+            # task_id, which would be unbounded cardinality if this
+            # were a metric label -- but Jaeger spans aren't scraped
+            # like Prometheus series, so a per-task_id *attribute*
+            # below is fine and is exactly what makes a single task's
+            # trace findable in the Jaeger UI).
+            with _tracer.start_as_current_span(f"scheduler.dispatch_task.{task.task_type}") as span:
+                span.set_attribute("task.id", str(task.task_id))
+                span.set_attribute("task.type", task.task_type)
+                queued_task = await state_manager.transition(
+                    task.task_id,
+                    TaskStatus.QUEUED,
+                    event_metadata={
+                        "reason": "scheduled_at_due",
+                        "scheduled_at": task.scheduled_at.isoformat(),
+                    },
+                )
+                await outbox_repo.enqueue(
+                    task_id=queued_task.task_id,
+                    task_type=queued_task.task_type,
+                    payload=queued_task.payload,
+                    priority=TaskPriority(queued_task.priority),
+                    trace_context=inject_trace_context(),
+                )
             claimed.append(queued_task)
 
         # Commits the QUEUED status, events, and outbox rows for

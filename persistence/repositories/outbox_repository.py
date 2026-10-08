@@ -27,6 +27,7 @@ class OutboxRepository:
         task_type: str,
         payload: dict,
         priority: TaskPriority,
+        trace_context: dict | None = None,
     ) -> OutboxMessage:
         """
         Call this *inside* the same session/transaction as whatever
@@ -34,12 +35,23 @@ class OutboxRepository:
         that transaction commits -- never on its own, separately
         committed transaction. That's the entire mechanism: the
         status change and this row either both land or neither does.
+
+        `trace_context` (Phase 19) is whatever
+        observability.tracing.inject_trace_context() captured from
+        the caller's currently active span -- the API's request
+        span, the scheduler's per-dispatch span, or (for a retry) the
+        *original* task's span, so the retry stays part of the same
+        trace rather than starting a new one. Defaults to None for
+        callers with no active span (tracing disabled, or genuinely
+        no parent), which the outbox relay treats as "start a fresh
+        trace" rather than an error.
         """
         message = OutboxMessage(
             task_id=task_id,
             task_type=task_type,
             payload=payload,
             priority=priority.value,
+            trace_context=trace_context,
         )
         self._session.add(message)
         await self._session.flush()

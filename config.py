@@ -126,6 +126,18 @@ class Settings(BaseSettings):
     # polled on an interval rather than computed at scrape time.
     metrics_poll_interval_seconds: float = 5.0
 
+    # ---- Tracing (Phase 19) ----
+    # Jaeger's built-in OTLP receiver (no separate OpenTelemetry
+    # Collector in this project -- see docs/tracing.md). gRPC, not
+    # HTTP: opentelemetry-exporter-otlp-proto-grpc is the one
+    # dependency this phase adds specifically for it.
+    otel_exporter_otlp_endpoint: str = "http://jaeger:4317"
+    # False disables tracing entirely (setup_tracing() leaves the
+    # OTel API's default no-op TracerProvider in place) rather than
+    # configuring an exporter nothing is listening for -- useful for
+    # local/test runs with no Jaeger container up.
+    otel_traces_enabled: bool = True
+
 
 @lru_cache
 def get_settings() -> Settings:

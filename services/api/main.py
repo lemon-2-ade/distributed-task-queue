@@ -49,6 +49,15 @@ The API still owns a RabbitMQConnection (not a TaskPublisher) purely
 for /ready's connectivity check and POST /tasks's backpressure check
 (messaging/backpressure.py's queue-depth lookup), neither of which
 involves publishing a message.
+
+Phase 19 instruments this app with FastAPIInstrumentor, the one piece
+of OpenTelemetry *auto*-instrumentation this project uses (see
+observability/tracing.py's module docstring for why asyncpg/aio-pika
+aren't also auto-instrumented): it gives every inbound HTTP request
+its own span for free, which is what lets
+services/api/services/task_service.py capture a meaningful trace
+context onto the outbox row without this module having to open a
+span by hand for every route.
 """
 
 import asyncio
@@ -57,6 +66,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from prometheus_client import make_asgi_app
 
 from config import get_settings
@@ -65,6 +75,7 @@ from coordination.load_balancer import LeastLoadedStrategy, RoundRobinStrategy
 from coordination.rate_limiter import RateLimiter
 from coordination.worker_registry import WorkerRegistry
 from messaging.connection import RabbitMQConnection
+from observability.tracing import setup_tracing
 from services.api.metrics import (
     http_request_duration_seconds,
     http_requests_total,
@@ -117,6 +128,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def create_app() -> FastAPI:
     settings = get_settings()
 
+    setup_tracing(
+        "api",
+        otel_exporter_otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+        otel_traces_enabled=settings.otel_traces_enabled,
+    )
+
     app = FastAPI(
         title="Distributed Task Queue API",
         version="0.1.0",
@@ -128,6 +145,7 @@ def create_app() -> FastAPI:
     )
 
     app.state.settings = settings
+    FastAPIInstrumentor.instrument_app(app)
 
     @app.middleware("http")
     async def _record_http_metrics(request: Request, call_next):

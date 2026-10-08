@@ -10,15 +10,30 @@ republishing, scheduled-task dispatch) now only ever writes an
 OutboxMessage row -- see persistence/models.py's OutboxMessage
 docstring and docs/outbox.md. This function is what actually drains
 that table into RabbitMQ.
+
+Phase 19: this is also the one place that bridges trace context from
+"stored as data on a Postgres row" back to "live on an AMQP message."
+Each row's trace_context (captured by whoever wrote it -- see
+persistence/models.py's OutboxMessage and
+observability/tracing.py's module docstring) is extracted into a new
+child span here, and that span's *own* context is what actually gets
+injected into the outgoing message's headers -- not the row's
+original context verbatim -- so the resulting trace shows this relay
+step as a real hop (its own span, with its own duration) between
+"written to Postgres" and "received by a worker," rather than
+silently disappearing.
 """
 
 import time
 
 from domain.states import TaskPriority
 from messaging.publisher import TaskPublisher
+from observability.tracing import get_tracer, inject_trace_context, start_span_from_carrier
 from persistence.database import AsyncSessionLocal
 from persistence.repositories.outbox_repository import OutboxRepository
 from services.outbox_relay.metrics import outbox_relay_poll_duration_seconds, outbox_relayed_total
+
+_tracer = get_tracer(__name__)
 
 
 async def relay_once(publisher: TaskPublisher, *, limit: int) -> int:
@@ -61,12 +76,18 @@ async def relay_once(publisher: TaskPublisher, *, limit: int) -> int:
         pending = await repo.claim_unpublished(limit=limit)
 
         for message in pending:
-            await publisher.publish_task(
-                task_id=message.task_id,
-                task_type=message.task_type,
-                payload=message.payload,
-                priority=TaskPriority(message.priority),
-            )
+            with start_span_from_carrier(
+                _tracer, f"outbox_relay.publish.{message.task_type}", message.trace_context
+            ) as span:
+                span.set_attribute("task.id", str(message.task_id))
+                span.set_attribute("task.type", message.task_type)
+                await publisher.publish_task(
+                    task_id=message.task_id,
+                    task_type=message.task_type,
+                    payload=message.payload,
+                    priority=TaskPriority(message.priority),
+                    headers=inject_trace_context(),
+                )
             await repo.mark_published(message)
 
         await session.commit()

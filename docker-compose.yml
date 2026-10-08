@@ -1,7 +1,18 @@
 # Phase 2 added `api`, Phase 5 adds `worker`, Phase 16 adds
 # `scheduler`, Phase 17 adds `outbox_relay`, Phase 18 adds
-# `prometheus` and `grafana`, on top of the Phase 1 infrastructure
-# (postgres, rabbitmq, redis).
+# `prometheus` and `grafana`, Phase 19 adds `jaeger`, on top of the
+# Phase 1 infrastructure (postgres, rabbitmq, redis).
+#
+# Phase 19 note on `jaeger` and OTEL_EXPORTER_OTLP_ENDPOINT: the four
+# application services don't list that env var under their own
+# `environment:` blocks below because `env_file: .env` already
+# injects it (and OTEL_TRACES_ENABLED) from .env/.env.example --
+# same as METRICS_POLL_INTERVAL_SECONDS before it. Jaeger's OTLP
+# receiver needs no health check gating here: OTLPSpanExporter runs
+# on a background thread via BatchSpanProcessor (observability/
+# tracing.py), so a service starting before Jaeger is merely a few
+# dropped spans at startup, never a reason to block the service
+# itself from coming up.
 #
 # Phase 18 note on worker/scheduler/outbox_relay's metrics ports:
 # each process opens its own standalone prometheus_client HTTP
@@ -85,6 +96,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -114,6 +127,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
 
   scheduler:
     build:
@@ -129,6 +144,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      jaeger:
+        condition: service_started
 
   outbox_relay:
     build:
@@ -147,6 +164,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      jaeger:
+        condition: service_started
 
   prometheus:
     image: prom/prometheus:v2.54.1
@@ -178,6 +197,24 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+
+  jaeger:
+    # all-in-one: Jaeger's collector, query service, and UI in one
+    # container, backed by in-memory storage -- a real deployment
+    # would point Jaeger at Elasticsearch/Cassandra/etc. instead, but
+    # this project's traces only need to survive one docker-compose
+    # session for the demo/teaching purpose they serve. See
+    # docs/tracing.md.
+    image: jaegertracing/all-in-one:1.60
+    restart: unless-stopped
+    environment:
+      # Jaeger's own built-in OTLP receiver -- see docs/tracing.md
+      # for why this project sends traces straight here instead of
+      # through a separate OpenTelemetry Collector.
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC receiver
 
 volumes:
   pgdata:

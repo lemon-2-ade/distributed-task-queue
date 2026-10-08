@@ -45,6 +45,7 @@ import signal
 
 from config import get_settings
 from observability.metrics import start_metrics_server
+from observability.tracing import setup_tracing
 from services.scheduler.dispatcher import claim_and_dispatch_due_tasks
 
 
@@ -52,6 +53,11 @@ async def main() -> None:
     settings = get_settings()
 
     start_metrics_server(settings.scheduler_metrics_port)
+    setup_tracing(
+        "scheduler",
+        otel_exporter_otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+        otel_traces_enabled=settings.otel_traces_enabled,
+    )
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

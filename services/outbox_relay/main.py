@@ -27,6 +27,7 @@ from config import get_settings
 from messaging.connection import RabbitMQConnection
 from messaging.publisher import TaskPublisher
 from observability.metrics import start_metrics_server
+from observability.tracing import setup_tracing
 from services.outbox_relay.relay import relay_once
 
 
@@ -34,6 +35,11 @@ async def main() -> None:
     settings = get_settings()
 
     start_metrics_server(settings.outbox_relay_metrics_port)
+    setup_tracing(
+        "outbox-relay",
+        otel_exporter_otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+        otel_traces_enabled=settings.otel_traces_enabled,
+    )
 
     rabbitmq = RabbitMQConnection()
     await rabbitmq.connect()

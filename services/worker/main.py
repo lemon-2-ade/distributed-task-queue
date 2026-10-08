@@ -77,6 +77,7 @@ from domain.states import TaskPriority
 from messaging.connection import RabbitMQConnection
 from messaging.queues import DEAD_LETTER_QUEUE, QUEUE_BY_PRIORITY
 from observability.metrics import start_metrics_server
+from observability.tracing import setup_tracing
 from scheduling.priority_scheduler import WeightedQueueSelector
 from services.worker.consumer import MessageHandler, make_dlq_handler, make_message_handler
 
@@ -167,6 +168,11 @@ async def main() -> None:
     # opens one solely to serve /metrics -- see
     # observability/metrics.py's start_metrics_server docstring.
     start_metrics_server(settings.worker_metrics_port)
+    setup_tracing(
+        "worker",
+        otel_exporter_otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+        otel_traces_enabled=settings.otel_traces_enabled,
+    )
 
     rabbitmq = RabbitMQConnection()
     await rabbitmq.connect()
