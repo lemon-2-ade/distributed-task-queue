@@ -104,7 +104,25 @@ class WorkerRegistry:
         # (up to WORKER_CONCURRENCY of them, see consumer.py) without
         # a read-modify-write race, which a naive "read the field,
         # add one, write it back" would have.
-        await self._redis.hincrby(_worker_key(worker_id), "active_task_count", 1)
+        #
+        # Phase 21 (chaos testing) found that this call, unguarded,
+        # sat *before* services/worker/consumer.py's main try/finally
+        # block -- so a Redis outage raised here before a single
+        # message of any task_type was ever processed, took down the
+        # whole handle() call (the message left unacked), and did so
+        # for every message this worker received for as long as Redis
+        # stayed down. That's strictly worse than this project's
+        # existing stance elsewhere (heartbeat()'s docstring already
+        # treats a Redis blip as something to absorb, not crash over):
+        # load tracking is a load-balancing *signal*, not something
+        # task correctness depends on, so it should degrade (stale/
+        # inaccurate load numbers) rather than take task processing
+        # down with it. See docs/chaos-testing.md's Redis-outage
+        # scenario for how this was found.
+        try:
+            await self._redis.hincrby(_worker_key(worker_id), "active_task_count", 1)
+        except Exception:
+            pass
 
     async def decrement_load(self, worker_id: str) -> None:
         # Never let this go negative -- e.g. a decrement arriving after
@@ -114,9 +132,19 @@ class WorkerRegistry:
         # at -1 instead of 0. A negative count would make this worker
         # look *more* available than an idle one to
         # LeastLoadedStrategy, which is the opposite of correct.
-        new_value = await self._redis.hincrby(_worker_key(worker_id), "active_task_count", -1)
-        if new_value < 0:
-            await self._redis.hset(_worker_key(worker_id), "active_task_count", 0)
+        #
+        # Same Phase 21 reasoning as increment_load() above: this call
+        # sits in services/worker/consumer.py's outer `finally`, so an
+        # unguarded failure here would mask whatever the handler
+        # actually did (success or failure) behind a Redis exception
+        # raised while just trying to clean up bookkeeping -- best-
+        # effort, same as increment_load().
+        try:
+            new_value = await self._redis.hincrby(_worker_key(worker_id), "active_task_count", -1)
+            if new_value < 0:
+                await self._redis.hset(_worker_key(worker_id), "active_task_count", 0)
+        except Exception:
+            pass
 
     async def deregister(self, worker_id: str) -> None:
         # Explicit removal on graceful shutdown, so a clean stop

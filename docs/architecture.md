@@ -51,6 +51,19 @@ or an admin view of which worker *should* pick up the next high-priority
 item. Conflating the two is a common misunderstanding this project
 deliberately keeps distinct.
 
+## Resilience verification
+
+Every component above is designed to survive specific failures (a
+worker dying mid-task, the broker or either datastore going
+unreachable) -- but a design doc claiming that and a real system
+proving it are different things. `scripts/chaos_test.py` (Phase 21)
+runs real failure-injection scenarios against a live
+`docker compose up` stack (kills a worker mid-execution, stops and
+restarts RabbitMQ/Postgres/Redis) and checks the system actually
+recovers the way the relevant doc above says it should. See
+`docs/chaos-testing.md`, including the one real gap this phase found
+and fixed.
+
 ## Status
 
 This document will grow section by section as each phase is implemented.
