@@ -15,6 +15,7 @@ process that ever talks to RabbitMQ to publish; this process is
 Postgres-only.
 """
 
+import time
 from datetime import datetime, timezone
 
 from domain.states import TaskPriority, TaskStatus
@@ -22,6 +23,7 @@ from persistence.database import AsyncSessionLocal
 from persistence.repositories.outbox_repository import OutboxRepository
 from persistence.repositories.task_repository import TaskRepository
 from persistence.state_manager import TaskStateManager
+from services.scheduler.metrics import scheduler_dispatched_total, scheduler_poll_duration_seconds
 
 
 async def claim_and_dispatch_due_tasks(*, limit: int) -> int:
@@ -34,6 +36,7 @@ async def claim_and_dispatch_due_tasks(*, limit: int) -> int:
     a special one.
     """
     now = datetime.now(timezone.utc)
+    started_at = time.perf_counter()
 
     async with AsyncSessionLocal() as session:
         repo = TaskRepository(session)
@@ -66,5 +69,9 @@ async def claim_and_dispatch_due_tasks(*, limit: int) -> int:
         # out, so the *next* scheduler replica's poll (this one or
         # another) can see and claim whatever's left.
         await session.commit()
+
+    scheduler_poll_duration_seconds.observe(time.perf_counter() - started_at)
+    if claimed:
+        scheduler_dispatched_total.inc(len(claimed))
 
     return len(claimed)

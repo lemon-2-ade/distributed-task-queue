@@ -12,10 +12,13 @@ docstring and docs/outbox.md. This function is what actually drains
 that table into RabbitMQ.
 """
 
+import time
+
 from domain.states import TaskPriority
 from messaging.publisher import TaskPublisher
 from persistence.database import AsyncSessionLocal
 from persistence.repositories.outbox_repository import OutboxRepository
+from services.outbox_relay.metrics import outbox_relay_poll_duration_seconds, outbox_relayed_total
 
 
 async def relay_once(publisher: TaskPublisher, *, limit: int) -> int:
@@ -51,6 +54,8 @@ async def relay_once(publisher: TaskPublisher, *, limit: int) -> int:
     one more legitimate source of them rather than a new category of
     problem.
     """
+    started_at = time.perf_counter()
+
     async with AsyncSessionLocal() as session:
         repo = OutboxRepository(session)
         pending = await repo.claim_unpublished(limit=limit)
@@ -65,5 +70,9 @@ async def relay_once(publisher: TaskPublisher, *, limit: int) -> int:
             await repo.mark_published(message)
 
         await session.commit()
+
+    outbox_relay_poll_duration_seconds.observe(time.perf_counter() - started_at)
+    if pending:
+        outbox_relayed_total.inc(len(pending))
 
     return len(pending)

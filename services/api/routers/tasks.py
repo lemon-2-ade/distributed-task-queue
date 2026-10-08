@@ -16,6 +16,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
 from messaging.backpressure import get_total_queue_depth
+from services.api.metrics import tasks_created_total, tasks_rejected_total
 from services.api.schemas import TaskCreateRequest, TaskEventResponse, TaskResponse
 from services.api.services.task_service import TaskService
 
@@ -37,6 +38,7 @@ async def _check_rate_limit(request: Request) -> None:
     for a simpler reason. See docs/rate-limiting-and-backpressure.md."""
     allowed, retry_after = await request.app.state.rate_limiter.check()
     if not allowed:
+        tasks_rejected_total.labels(reason="rate_limited").inc()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="rate limit exceeded",
@@ -49,6 +51,7 @@ async def _check_backpressure(request: Request) -> None:
     channel = request.app.state.rabbitmq.channel
     depth = await get_total_queue_depth(channel)
     if depth >= settings.backpressure_max_queue_depth:
+        tasks_rejected_total.labels(reason="backpressure").inc()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
@@ -83,6 +86,13 @@ async def create_task(body: TaskCreateRequest, request: Request, response: Respo
         idempotency_key=body.idempotency_key,
         scheduled_at=body.scheduled_at,
     )
+    if was_created:
+        # Only a genuinely new task -- not an idempotent replay
+        # (task_service.create_task returns was_created=False for
+        # those, see its docstring) -- counts as newly "created"
+        # here. Counting replays too would make this metric track
+        # request volume, not actual new work entering the system.
+        tasks_created_total.labels(task_type=body.task_type, priority=body.priority.value).inc()
     response.status_code = status.HTTP_201_CREATED if was_created else status.HTTP_200_OK
     return TaskResponse.model_validate(task)
 

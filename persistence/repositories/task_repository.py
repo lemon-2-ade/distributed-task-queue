@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from domain.states import TaskPriority, TaskStatus
@@ -72,6 +72,19 @@ class TaskRepository:
             stmt = stmt.where(Task.status == status.value)
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
+
+    async def count_by_status(self, status: TaskStatus) -> int:
+        """
+        Phase 18: backs the `dead_lettered_tasks_current` gauge
+        (services/api/metrics.py) -- a plain COUNT(*) rather than
+        `len(await self.list(...))`, since the metrics poll loop only
+        ever needs the number, not the rows themselves, and a
+        COUNT(*) never has to materialize however many thousand
+        DEAD_LETTERED tasks might exist.
+        """
+        stmt = select(func.count()).select_from(Task).where(Task.status == status.value)
+        result = await self._session.execute(stmt)
+        return result.scalar_one()
 
     async def claim_due_scheduled_tasks(self, *, now: datetime, limit: int = 50) -> list[Task]:
         """

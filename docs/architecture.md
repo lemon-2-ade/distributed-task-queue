@@ -31,7 +31,7 @@ follows from that one sentence:
 | **Load Balancing / Scheduling Strategy** | Application-level worker selection (round-robin, least-loaded) — distinct from RabbitMQ's own consumer dispatch, see below. |
 | **Retry Manager** | Computes backoff/jitter and decides retry vs. dead-letter. |
 | **Task State Manager** | Enforces the task state machine (see `docs/task-lifecycle.md`, added when the state machine is implemented). |
-| **Observability layer** | Metrics, structured logs, and traces, shared by every service. |
+| **Observability layer** | Metrics (Phase 18: each service exposes a Prometheus `/metrics` endpoint, scraped by the `prometheus` service and visualized in `grafana` -- see docs/metrics.md). Structured logging and OpenTelemetry tracing are later phases, not yet built. |
 | **CLI / admin dashboard** | Optional, later-phase conveniences layered on top of the API. |
 
 ## RabbitMQ dispatch vs. application-level load balancing

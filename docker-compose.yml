@@ -1,6 +1,20 @@
 # Phase 2 added `api`, Phase 5 adds `worker`, Phase 16 adds
-# `scheduler`, Phase 17 adds `outbox_relay`, on top of the Phase 1
-# infrastructure (postgres, rabbitmq, redis).
+# `scheduler`, Phase 17 adds `outbox_relay`, Phase 18 adds
+# `prometheus` and `grafana`, on top of the Phase 1 infrastructure
+# (postgres, rabbitmq, redis).
+#
+# Phase 18 note on worker/scheduler/outbox_relay's metrics ports:
+# each process opens its own standalone prometheus_client HTTP
+# listener (observability/metrics.py's start_metrics_server -- these
+# three have no other HTTP server to mount onto, unlike the API, see
+# services/api/metrics.py). `expose` (not `ports`) is deliberate:
+# it documents the port and makes it reachable from `prometheus`
+# over the compose network, without publishing it to the host --
+# publishing would collide the moment any of these services is run
+# with `--scale N>1`, since every replica would try to bind the same
+# host port. See docs/metrics.md for the related, known gap around
+# Prometheus actually scraping more than one replica of a scaled
+# service in plain Docker Compose.
 name: distributed-task-queue
 
 services:
@@ -77,6 +91,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    # No separate metrics port -- /metrics is mounted on this same
+    # app/port (services/api/main.py), already published above.
 
   worker:
     build:
@@ -89,6 +105,8 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       RABBITMQ_URL: ${RABBITMQ_URL}
       REDIS_URL: ${REDIS_URL}
+    expose:
+      - "${WORKER_METRICS_PORT:-9101}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,6 +124,8 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL}
+    expose:
+      - "${SCHEDULER_METRICS_PORT:-9102}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -120,13 +140,48 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       RABBITMQ_URL: ${RABBITMQ_URL}
+    expose:
+      - "${OUTBOX_RELAY_METRICS_PORT:-9103}"
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
 
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+      - worker
+      - scheduler
+      - outbox_relay
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me}
+      # No new user signs up for a demo project's Grafana.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
   rabbitmqdata:
   redisdata:
+  prometheusdata:
+  grafanadata:

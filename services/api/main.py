@@ -51,10 +51,13 @@ for /ready's connectivity check and POST /tasks's backpressure check
 involves publishing a message.
 """
 
+import asyncio
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from prometheus_client import make_asgi_app
 
 from config import get_settings
 from coordination.cancellation import CancellationBroadcaster
@@ -62,6 +65,11 @@ from coordination.load_balancer import LeastLoadedStrategy, RoundRobinStrategy
 from coordination.rate_limiter import RateLimiter
 from coordination.worker_registry import WorkerRegistry
 from messaging.connection import RabbitMQConnection
+from services.api.metrics import (
+    http_request_duration_seconds,
+    http_requests_total,
+    poll_external_gauges,
+)
 from services.api.routers import health, tasks, workers
 
 
@@ -83,9 +91,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         "round_robin": RoundRobinStrategy(),
         "least_loaded": LeastLoadedStrategy(),
     }
+
+    # Phase 18: refreshes the gauges that reflect state living
+    # outside this process (queue depth, outbox lag, dead-lettered
+    # count) on a timer -- see services/api/metrics.py's
+    # poll_external_gauges docstring for why this can't just be
+    # computed inline at scrape time.
+    settings = get_settings()
+    metrics_stop_event = asyncio.Event()
+    metrics_poll_task = asyncio.create_task(
+        poll_external_gauges(app, settings.metrics_poll_interval_seconds, metrics_stop_event)
+    )
+
     try:
         yield
     finally:
+        metrics_stop_event.set()
+        await metrics_poll_task
         await rabbitmq.close()
         await app.state.worker_registry.close()
         await app.state.cancellation_broadcaster.close()
@@ -106,6 +128,38 @@ def create_app() -> FastAPI:
     )
 
     app.state.settings = settings
+
+    @app.middleware("http")
+    async def _record_http_metrics(request: Request, call_next):
+        """
+        `request.url.path` (not `request.scope["route"].path`) is
+        used as the label on purpose, despite the well-known
+        cardinality risk of raw paths (a real UUID per task_id would
+        blow up the metric's label cardinality over time) --
+        deliberately accepted here rather than solved, because
+        solving it means resolving the *matched route template*
+        (`/tasks/{task_id}`) before the label is recorded, which
+        needs Starlette internals this middleware form doesn't have
+        easy access to. A real production deployment would want that
+        fix; this project documents the gap instead of leaving it
+        silently unaddressed. See docs/metrics.md.
+        """
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration = time.perf_counter() - start
+        path = request.url.path
+        http_requests_total.labels(
+            method=request.method, path=path, status=response.status_code
+        ).inc()
+        http_request_duration_seconds.labels(method=request.method, path=path).observe(duration)
+        return response
+
+    # Mounted, not a route: prometheus_client's generate_latest()
+    # output isn't a Pydantic model FastAPI would know how to
+    # serialize, and this ASGI app already handles content-type and
+    # encoding correctly on its own -- a hand-written route would
+    # just be re-implementing what make_asgi_app() already does.
+    app.mount("/metrics", make_asgi_app())
 
     app.include_router(health.router)
     app.include_router(tasks.router)

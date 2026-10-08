@@ -26,11 +26,14 @@ import signal
 from config import get_settings
 from messaging.connection import RabbitMQConnection
 from messaging.publisher import TaskPublisher
+from observability.metrics import start_metrics_server
 from services.outbox_relay.relay import relay_once
 
 
 async def main() -> None:
     settings = get_settings()
+
+    start_metrics_server(settings.outbox_relay_metrics_port)
 
     rabbitmq = RabbitMQConnection()
     await rabbitmq.connect()

@@ -76,6 +76,7 @@ from coordination.worker_registry import WorkerRegistry
 from domain.states import TaskPriority
 from messaging.connection import RabbitMQConnection
 from messaging.queues import DEAD_LETTER_QUEUE, QUEUE_BY_PRIORITY
+from observability.metrics import start_metrics_server
 from scheduling.priority_scheduler import WeightedQueueSelector
 from services.worker.consumer import MessageHandler, make_dlq_handler, make_message_handler
 
@@ -161,6 +162,11 @@ async def _run_priority_dispatch_loop(
 
 async def main() -> None:
     settings = get_settings()
+
+    # Phase 18: this process has no HTTP server of its own, so this
+    # opens one solely to serve /metrics -- see
+    # observability/metrics.py's start_metrics_server docstring.
+    start_metrics_server(settings.worker_metrics_port)
 
     rabbitmq = RabbitMQConnection()
     await rabbitmq.connect()

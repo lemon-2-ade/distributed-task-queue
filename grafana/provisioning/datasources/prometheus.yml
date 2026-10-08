@@ -1,0 +1,15 @@
+# Phase 18. Provisioned (not clicked-through in the UI) so a fresh
+# `docker compose up` always has a working Grafana <-> Prometheus
+# link with no manual setup step -- consistent with this project's
+# "nothing requires a human to click through a UI to become usable"
+# stance elsewhere (migrations run automatically, queue topology is
+# declared in code, etc.).
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

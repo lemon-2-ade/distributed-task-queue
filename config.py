@@ -109,6 +109,23 @@ class Settings(BaseSettings):
     retry_max_delay_seconds: float = 60.0
     retry_jitter_fraction: float = 0.2
 
+    # ---- Metrics (Phase 18) ----
+    # The worker, scheduler, and outbox relay have no HTTP server of
+    # their own, so each opens a small, separate prometheus_client
+    # listener on one of these ports purely to serve /metrics (see
+    # observability/metrics.py's start_metrics_server). The API
+    # needs no port of its own here -- it mounts /metrics on its
+    # existing FastAPI app/port instead (services/api/main.py).
+    worker_metrics_port: int = 9101
+    scheduler_metrics_port: int = 9102
+    outbox_relay_metrics_port: int = 9103
+    # How often services/api/metrics.py's background loop refreshes
+    # the gauges that reflect state living *outside* the API process
+    # (RabbitMQ queue depth, unpublished outbox rows, dead-lettered
+    # task count) -- see that module's docstring for why these are
+    # polled on an interval rather than computed at scrape time.
+    metrics_poll_interval_seconds: float = 5.0
+
 
 @lru_cache
 def get_settings() -> Settings:

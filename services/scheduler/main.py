@@ -44,11 +44,14 @@ import asyncio
 import signal
 
 from config import get_settings
+from observability.metrics import start_metrics_server
 from services.scheduler.dispatcher import claim_and_dispatch_due_tasks
 
 
 async def main() -> None:
     settings = get_settings()
+
+    start_metrics_server(settings.scheduler_metrics_port)
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()

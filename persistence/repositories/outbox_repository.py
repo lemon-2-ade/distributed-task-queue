@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from domain.states import TaskPriority
@@ -67,3 +67,20 @@ class OutboxRepository:
     async def mark_published(self, message: OutboxMessage) -> None:
         message.published_at = datetime.now(timezone.utc)
         await self._session.flush()
+
+    async def count_unpublished(self) -> int:
+        """
+        Phase 18: backs the `outbox_unpublished_rows` gauge
+        (services/api/metrics.py) -- a cheap, indexed COUNT(*) (the
+        partial index on `published_at IS NULL`, see
+        persistence/models.py's OutboxMessage, makes this fast even
+        as the table grows) used purely to watch outbox-relay lag
+        from the outside: a number that's consistently near zero
+        means the relay is keeping up; one that keeps climbing means
+        it's falling behind or down.
+        """
+        stmt = select(func.count()).select_from(OutboxMessage).where(
+            OutboxMessage.published_at.is_(None)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one()

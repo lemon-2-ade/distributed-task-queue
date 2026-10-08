@@ -101,6 +101,7 @@ docs/graceful-shutdown.md.
 
 import asyncio
 import json
+import time
 import uuid
 
 from aio_pika.abc import AbstractIncomingMessage
@@ -114,6 +115,7 @@ from persistence.database import AsyncSessionLocal
 from persistence.models import Task
 from persistence.repositories.outbox_repository import OutboxRepository
 from persistence.state_manager import TaskStateManager
+from services.worker.metrics import task_duration_seconds, tasks_processed_total, worker_active_tasks
 from task_handlers import TASK_HANDLERS
 
 
@@ -194,6 +196,7 @@ class MessageHandler:
             # HINCRBY rather than a plain counter, and why the
             # decrement side guards against going negative.
             await self._registry.increment_load(self.worker_id)
+            worker_active_tasks.inc()
             try:
                 try:
                     task = await _transition(task_id, TaskStatus.RUNNING, worker_id=self.worker_id)
@@ -236,6 +239,9 @@ class MessageHandler:
                         await _record_duplicate_delivery(
                             task_id, event_metadata={"worker_id": self.worker_id}
                         )
+                        tasks_processed_total.labels(
+                            task_type=task_type, outcome="duplicate_discarded"
+                        ).inc()
                     # Otherwise: the task reached some other status
                     # entirely by the time this arrived -- the clearest
                     # case is an admin cancelling a PENDING/QUEUED task
@@ -252,11 +258,20 @@ class MessageHandler:
                         TaskStatus.FAILED,
                         error=f"no handler registered for task_type={task_type!r}",
                     )
+                    tasks_processed_total.labels(task_type=task_type, outcome="no_handler").inc()
                     await message.nack(requeue=False)
                     return
 
                 handler_task = asyncio.ensure_future(handler(payload))
                 self.running_tasks[task_id] = handler_task
+                # Phase 18: timed from right before the handler
+                # actually starts to whichever exit below is taken --
+                # deliberately excludes everything before this point
+                # (parsing, the RUNNING transition) and everything
+                # after (acking, the terminal-state write), since
+                # those are worker/infra overhead, not the handler's
+                # own execution time. See services/worker/metrics.py.
+                started_at = time.perf_counter()
                 try:
                     if task.timeout:
                         result = await asyncio.wait_for(handler_task, timeout=task.timeout)
@@ -264,6 +279,7 @@ class MessageHandler:
                         result = await handler_task
                 except asyncio.TimeoutError:
                     # wait_for already cancelled handler_task for us.
+                    duration = time.perf_counter() - started_at
                     await _handle_terminal_failure(
                         message,
                         task_id=task_id,
@@ -273,6 +289,7 @@ class MessageHandler:
                         error=TimeoutError(f"task exceeded its {task.timeout}s timeout"),
                         failure_status=TaskStatus.TIMEOUT,
                         settings=self._settings,
+                        duration_seconds=duration,
                     )
                     return
                 except asyncio.CancelledError:
@@ -283,6 +300,9 @@ class MessageHandler:
                     # worker shutdown, which doesn't touch
                     # running_tasks at all. No retry: this is a
                     # deliberate stop, not a failure.
+                    duration = time.perf_counter() - started_at
+                    task_duration_seconds.labels(task_type=task_type).observe(duration)
+                    tasks_processed_total.labels(task_type=task_type, outcome="cancelled").inc()
                     await _transition(
                         task_id,
                         TaskStatus.CANCELLED,
@@ -291,6 +311,7 @@ class MessageHandler:
                     await message.ack()
                     return
                 except Exception as exc:
+                    duration = time.perf_counter() - started_at
                     await _handle_terminal_failure(
                         message,
                         task_id=task_id,
@@ -300,14 +321,19 @@ class MessageHandler:
                         error=exc,
                         failure_status=TaskStatus.FAILED,
                         settings=self._settings,
+                        duration_seconds=duration,
                     )
                     return
                 finally:
                     self.running_tasks.pop(task_id, None)
 
+                duration = time.perf_counter() - started_at
+                task_duration_seconds.labels(task_type=task_type).observe(duration)
+                tasks_processed_total.labels(task_type=task_type, outcome="success").inc()
                 await _transition(task_id, TaskStatus.SUCCESS, result=result)
                 await message.ack()
             finally:
+                worker_active_tasks.dec()
                 await self._registry.decrement_load(self.worker_id)
 
 
@@ -340,6 +366,7 @@ async def _handle_terminal_failure(
     error: Exception,
     failure_status: TaskStatus,
     settings,
+    duration_seconds: float,
 ) -> None:
     """
     Shared by two distinct causes that nonetheless follow the exact
@@ -355,6 +382,7 @@ async def _handle_terminal_failure(
     same retry budget.
     """
     task = await _transition(task_id, failure_status, error=str(error))
+    task_duration_seconds.labels(task_type=task_type).observe(duration_seconds)
 
     is_permanent = isinstance(error, PermanentTaskError)
     retries_remaining = task.retry_count < task.max_retries
@@ -362,7 +390,12 @@ async def _handle_terminal_failure(
     if is_permanent or not retries_remaining:
         # Exhausted or unretryable: leave it FAILED/TIMEOUT, send the
         # message to the DLQ. See this module's docstring for why
-        # nothing marks it DEAD_LETTERED yet.
+        # nothing marks it DEAD_LETTERED yet. "dead_lettered" here
+        # describes this worker's outcome (handed off to the DLQ),
+        # one step ahead of Task.status actually reading
+        # DEAD_LETTERED -- see make_dlq_handler()'s docstring on that
+        # same eventual-consistency window.
+        tasks_processed_total.labels(task_type=task_type, outcome="dead_lettered").inc()
         await message.nack(requeue=False)
         return
 
@@ -387,6 +420,7 @@ async def _handle_terminal_failure(
     await _transition_to_queued_and_enqueue_outbox(
         task_id, task_type=task_type, payload=payload, priority=priority
     )
+    tasks_processed_total.labels(task_type=task_type, outcome="retried").inc()
     # Only now: the original message's work (recording the failure
     # and durably recording its replacement's intent-to-publish) is
     # done, so it's safe to ack it. Acking earlier and then crashing

@@ -1,0 +1,27 @@
+# Phase 18. Static scrape targets, not service discovery -- correct
+# for this project's default, unscaled (replicas=1) docker-compose
+# configuration. See docker-compose.yml's Phase 18 note and
+# docs/metrics.md for why this doesn't (and, without real service
+# discovery, can't) correctly scrape more than one replica of a
+# scaled worker/scheduler/outbox_relay service.
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+
+  - job_name: worker
+    static_configs:
+      - targets: ["worker:9101"]
+
+  - job_name: scheduler
+    static_configs:
+      - targets: ["scheduler:9102"]
+
+  - job_name: outbox_relay
+    static_configs:
+      - targets: ["outbox_relay:9103"]

@@ -1,0 +1,15 @@
+# Phase 18. Points Grafana at grafana/dashboards/ (mounted read-only
+# in docker-compose.yml) so task-queue-overview.json loads
+# automatically on startup, same provisioning-over-click-ops
+# reasoning as the datasource config beside this file.
+apiVersion: 1
+
+providers:
+  - name: distributed-task-queue
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
