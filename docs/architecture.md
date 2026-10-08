@@ -64,6 +64,16 @@ recovers the way the relevant doc above says it should. See
 `docs/chaos-testing.md`, including the one real gap this phase found
 and fixed.
 
+Resilience under *failure* and resilience under *load* are different
+questions, so Phase 22 adds a second, separate verification tool
+rather than folding load generation into the chaos script:
+`scripts/load_test.py` drives real concurrent HTTP traffic against a
+live stack and reports actual latency percentiles, status-code
+distribution, and end-to-end completion time, and specifically
+validates that the rate limiter and backpressure admission control
+(`docs/rate-limiting-and-backpressure.md`) behave as designed under
+real concurrency, not just in a unit test. See `docs/load-testing.md`.
+
 ## Status
 
 This document will grow section by section as each phase is implemented.
