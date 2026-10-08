@@ -44,3 +44,28 @@ worker_active_tasks = Gauge(
     "worker_active_tasks",
     "Handlers this worker process is currently executing",
 )
+
+# Phase 20: circuit breaker visibility. `worker_circuit_breaker_state`
+# is a per-task_type gauge, not a Counter, because a breaker's state
+# at any instant is exactly what an operator wants to see on a
+# dashboard (closed=0 right now, or open=1 right now) -- the
+# CircuitState enum's own 0/1/2 ordering (domain/circuit_breaker.py)
+# is reused directly as the numeric value rather than inventing a
+# separate mapping. `circuit_breaker_rejections_total` is the
+# corresponding Counter: how many calls this worker fast-rejected
+# instead of running the handler at all, which is the thing this
+# whole phase exists to make happen instead of a slow, per-task
+# retry-and-backoff discovery of the same outage -- see
+# docs/circuit-breaker.md.
+worker_circuit_breaker_state = Gauge(
+    "worker_circuit_breaker_state",
+    "Current circuit breaker state for this task_type on this worker "
+    "(0=closed, 1=open, 2=half_open)",
+    ["task_type"],
+)
+circuit_breaker_rejections_total = Counter(
+    "circuit_breaker_rejections_total",
+    "Task executions this worker rejected immediately because the "
+    "task_type's circuit breaker was open, instead of running the handler",
+    ["task_type"],
+)

@@ -108,6 +108,7 @@ from aio_pika.abc import AbstractIncomingMessage
 
 from config import get_settings
 from coordination.worker_registry import WorkerRegistry
+from domain.circuit_breaker import CircuitBreaker, CircuitBreakerOpenError, CircuitState
 from domain.exceptions import InvalidStateTransitionError, PermanentTaskError
 from domain.retry_policy import compute_backoff_seconds
 from domain.states import TaskPriority, TaskStatus
@@ -116,8 +117,23 @@ from persistence.database import AsyncSessionLocal
 from persistence.models import Task
 from persistence.repositories.outbox_repository import OutboxRepository
 from persistence.state_manager import TaskStateManager
-from services.worker.metrics import task_duration_seconds, tasks_processed_total, worker_active_tasks
+from services.worker.metrics import (
+    circuit_breaker_rejections_total,
+    task_duration_seconds,
+    tasks_processed_total,
+    worker_active_tasks,
+    worker_circuit_breaker_state,
+)
 from task_handlers import TASK_HANDLERS
+
+# CircuitState's declaration order (CLOSED, OPEN, HALF_OPEN) doubles
+# as the 0/1/2 the worker_circuit_breaker_state gauge exposes --
+# see services/worker/metrics.py.
+_CIRCUIT_STATE_GAUGE_VALUE = {
+    CircuitState.CLOSED: 0,
+    CircuitState.OPEN: 1,
+    CircuitState.HALF_OPEN: 2,
+}
 
 _tracer = get_tracer(__name__)
 
@@ -131,6 +147,13 @@ class MessageHandler:
     handle() invocation currently in progress at all, including ones
     still waiting on the semaphore (`in_flight`, used by
     wait_for_drain() during graceful shutdown).
+
+    Phase 20 adds `_circuit_breakers`: one CircuitBreaker
+    (domain/circuit_breaker.py) per task_type this worker has ever
+    seen, created lazily on first use. Living here (rather than as a
+    module-level dict) is what makes it this *process's* state --
+    see docs/circuit-breaker.md for why that's deliberate and not
+    shared across workers.
     """
 
     def __init__(self, worker_id: str, concurrency: int, registry: WorkerRegistry) -> None:
@@ -140,6 +163,17 @@ class MessageHandler:
         self._settings = get_settings()
         self.running_tasks: dict[uuid.UUID, asyncio.Task] = {}
         self.in_flight: set[asyncio.Task] = set()
+        self._circuit_breakers: dict[str, CircuitBreaker] = {}
+
+    def _circuit_breaker_for(self, task_type: str) -> CircuitBreaker:
+        breaker = self._circuit_breakers.get(task_type)
+        if breaker is None:
+            breaker = CircuitBreaker(
+                failure_threshold=self._settings.circuit_breaker_failure_threshold,
+                open_duration_seconds=self._settings.circuit_breaker_open_duration_seconds,
+            )
+            self._circuit_breakers[task_type] = breaker
+        return breaker
 
     def cancel_task(self, task_id: uuid.UUID) -> bool:
         """Called from the cancellation listener (main.py) when a
@@ -270,6 +304,40 @@ class MessageHandler:
                         await message.nack(requeue=False)
                         return
 
+                    # Phase 20: a task_type whose circuit is OPEN is
+                    # rejected here, before the handler ever runs --
+                    # see domain/circuit_breaker.py and
+                    # docs/circuit-breaker.md for why this check sits
+                    # *after* the no_handler check (nothing to protect
+                    # a circuit for if there's no handler at all) but
+                    # *before* any handler-execution cost is paid.
+                    breaker = (
+                        self._circuit_breaker_for(task_type)
+                        if self._settings.circuit_breaker_enabled
+                        else None
+                    )
+                    if breaker is not None:
+                        worker_circuit_breaker_state.labels(task_type=task_type).set(
+                            _CIRCUIT_STATE_GAUGE_VALUE[breaker.state]
+                        )
+                        if not breaker.allow_request():
+                            circuit_breaker_rejections_total.labels(task_type=task_type).inc()
+                            await _handle_terminal_failure(
+                                message,
+                                task_id=task_id,
+                                task_type=task_type,
+                                payload=payload,
+                                priority=priority,
+                                error=CircuitBreakerOpenError(
+                                    f"circuit breaker open for task_type={task_type!r}; "
+                                    "rejecting without running the handler"
+                                ),
+                                failure_status=TaskStatus.FAILED,
+                                settings=self._settings,
+                                duration_seconds=None,
+                            )
+                            return
+
                     handler_task = asyncio.ensure_future(handler(payload))
                     self.running_tasks[task_id] = handler_task
                     # Phase 18: timed from right before the handler
@@ -287,6 +355,11 @@ class MessageHandler:
                             result = await handler_task
                     except asyncio.TimeoutError:
                         # wait_for already cancelled handler_task for us.
+                        if breaker is not None:
+                            breaker.record_failure()
+                            worker_circuit_breaker_state.labels(task_type=task_type).set(
+                                _CIRCUIT_STATE_GAUGE_VALUE[breaker.state]
+                            )
                         duration = time.perf_counter() - started_at
                         await _handle_terminal_failure(
                             message,
@@ -319,6 +392,11 @@ class MessageHandler:
                         await message.ack()
                         return
                     except Exception as exc:
+                        if breaker is not None:
+                            breaker.record_failure()
+                            worker_circuit_breaker_state.labels(task_type=task_type).set(
+                                _CIRCUIT_STATE_GAUGE_VALUE[breaker.state]
+                            )
                         duration = time.perf_counter() - started_at
                         await _handle_terminal_failure(
                             message,
@@ -335,6 +413,11 @@ class MessageHandler:
                     finally:
                         self.running_tasks.pop(task_id, None)
 
+                    if breaker is not None:
+                        breaker.record_success()
+                        worker_circuit_breaker_state.labels(task_type=task_type).set(
+                            _CIRCUIT_STATE_GAUGE_VALUE[breaker.state]
+                        )
                     duration = time.perf_counter() - started_at
                     task_duration_seconds.labels(task_type=task_type).observe(duration)
                     tasks_processed_total.labels(task_type=task_type, outcome="success").inc()
@@ -374,23 +457,34 @@ async def _handle_terminal_failure(
     error: Exception,
     failure_status: TaskStatus,
     settings,
-    duration_seconds: float,
+    duration_seconds: float | None,
 ) -> None:
     """
-    Shared by two distinct causes that nonetheless follow the exact
+    Shared by three distinct causes that nonetheless follow the exact
     same retry-or-dead-letter logic: a handler raising an exception
-    (`failure_status=FAILED`, Phase 8) and a handler exceeding its
-    `Task.timeout` (`failure_status=TIMEOUT`, Phase 12). Both FAILED
-    and TIMEOUT have identical outgoing edges in the state machine
-    (-> RETRYING or -> DEAD_LETTERED, domain/states/transitions.py),
-    which is exactly what makes sharing this function correct rather
-    than coincidental: from the retry policy's point of view, "it
-    raised" and "it ran too long" are the same kind of transient
-    problem, worth the same backoff-and-retry treatment, up to the
-    same retry budget.
+    (`failure_status=FAILED`, Phase 8), a handler exceeding its
+    `Task.timeout` (`failure_status=TIMEOUT`, Phase 12), and (Phase
+    20) a circuit breaker rejecting the task before any handler ran
+    at all. All three have identical outgoing edges in the state
+    machine (-> RETRYING or -> DEAD_LETTERED,
+    domain/states/transitions.py), which is exactly what makes
+    sharing this function correct rather than coincidental: from the
+    retry policy's point of view, "it raised," "it ran too long," and
+    "it never got to run because the circuit was open" are all the
+    same kind of transient problem, worth the same backoff-and-retry
+    treatment, up to the same retry budget.
+
+    `duration_seconds=None` (only ever passed for the circuit-breaker
+    case) deliberately skips the task_duration_seconds histogram
+    below -- recording a 0-second duration for a handler that never
+    actually ran would quietly inflate the fast end of that
+    histogram with executions that never happened, misleading anyone
+    reading p50/p95 handler latency off it. See
+    services/worker/metrics.py and docs/circuit-breaker.md.
     """
     task = await _transition(task_id, failure_status, error=str(error))
-    task_duration_seconds.labels(task_type=task_type).observe(duration_seconds)
+    if duration_seconds is not None:
+        task_duration_seconds.labels(task_type=task_type).observe(duration_seconds)
 
     is_permanent = isinstance(error, PermanentTaskError)
     retries_remaining = task.retry_count < task.max_retries

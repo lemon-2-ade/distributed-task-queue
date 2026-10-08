@@ -14,6 +14,9 @@ follows from that one sentence:
   allowed to submit right now) without a shared process → Redis.
 - All of it has to be **observable**, because distributed failures are
   invisible by default → Prometheus, Grafana, OpenTelemetry/Jaeger.
+- Failures in one task_type have to be **contained** so they don't
+  burn capacity meant for everyone else → a per-task_type circuit
+  breaker in the worker.
 
 ## Components
 
@@ -30,6 +33,7 @@ follows from that one sentence:
 | **Redis coordination layer** | Ephemeral, fast-changing state: heartbeats, rate-limit counters, short-lived locks/leases. Never the system of record. |
 | **Load Balancing / Scheduling Strategy** | Application-level worker selection (round-robin, least-loaded) — distinct from RabbitMQ's own consumer dispatch, see below. |
 | **Retry Manager** | Computes backoff/jitter and decides retry vs. dead-letter. |
+| **Circuit Breaker** | Per-task_type, per-worker-process failure tracking (Phase 20): opens after consecutive handler failures and rejects further calls of that task_type immediately (no handler execution) until a cooldown elapses, then allows a single trial call before fully closing -- see `docs/circuit-breaker.md`. Deliberately local to each worker process, not shared via Redis. |
 | **Task State Manager** | Enforces the task state machine (see `docs/task-lifecycle.md`, added when the state machine is implemented). |
 | **Observability layer** | Metrics (Phase 18: each service exposes a Prometheus `/metrics` endpoint, scraped by the `prometheus` service and visualized in `grafana` -- see docs/metrics.md) and distributed tracing (Phase 19: OpenTelemetry spans exported via OTLP/gRPC to the `jaeger` service, propagated across RabbitMQ and the transactional outbox -- see docs/tracing.md). Structured logging is plain per-event log lines, already present since early phases. |
 | **CLI / admin dashboard** | Optional, later-phase conveniences layered on top of the API. |

@@ -138,6 +138,18 @@ class Settings(BaseSettings):
     # local/test runs with no Jaeger container up.
     otel_traces_enabled: bool = True
 
+    # ---- Circuit breaker (Phase 20) ----
+    # Per-task_type, per-worker-process -- see domain/circuit_breaker.py
+    # and docs/circuit-breaker.md for the full design and why this
+    # state is deliberately local rather than shared across workers.
+    circuit_breaker_enabled: bool = True
+    # Consecutive handler failures (of the SAME task_type, within one
+    # worker process) before that task_type's circuit opens.
+    circuit_breaker_failure_threshold: int = 5
+    # How long a tripped circuit stays OPEN (rejecting immediately)
+    # before allowing a single HALF_OPEN trial call through.
+    circuit_breaker_open_duration_seconds: float = 30.0
+
 
 @lru_cache
 def get_settings() -> Settings:
