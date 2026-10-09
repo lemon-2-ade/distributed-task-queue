@@ -33,6 +33,7 @@ used to crash task handling outright on a Redis outage -- see that
 file's Phase 21 comments).
 """
 
+import os
 import re
 import subprocess
 import sys
@@ -43,6 +44,13 @@ import httpx
 import typer
 
 API_BASE_URL = "http://localhost:8000"
+# Phase 23 requires an X-API-Key header on /tasks (see
+# services/api/auth.py) -- read from the same environment variable
+# the stack's own .env sets, same reasoning as scripts/load_test.py.
+# Harmless to also send on the still-open /metrics and /ready calls
+# this script makes with the same client.
+API_KEY = os.environ.get("API_KEY", "change-me")
+_AUTH_HEADERS = {"X-API-Key": API_KEY}
 COMPOSE_PROJECT_DIR = "."
 
 app = typer.Typer(help="Chaos/failure-injection scenarios against a live docker-compose stack.")
@@ -142,7 +150,7 @@ def worker_crash() -> None:
     project already built (Phase 13) to avoid doing that twice.
     """
     print("=== Scenario: worker crash mid-task ===")
-    with httpx.Client(base_url=API_BASE_URL, timeout=10.0) as client:
+    with httpx.Client(base_url=API_BASE_URL, timeout=10.0, headers=_AUTH_HEADERS) as client:
         task_id = _create_task(client, task_type="sleep", payload={"seconds": 8})
         print(f"  created task {task_id} (sleep 8s)")
 
@@ -187,7 +195,7 @@ def rabbitmq_outage() -> None:
     """
     print("=== Scenario: RabbitMQ outage ===")
     task_count = 5
-    with httpx.Client(base_url=API_BASE_URL, timeout=10.0) as client:
+    with httpx.Client(base_url=API_BASE_URL, timeout=10.0, headers=_AUTH_HEADERS) as client:
         print("  stopping rabbitmq...")
         _compose("stop", "rabbitmq")
 
@@ -244,7 +252,7 @@ def postgres_outage() -> None:
     its own once the database is reachable again.
     """
     print("=== Scenario: Postgres outage ===")
-    with httpx.Client(base_url=API_BASE_URL, timeout=10.0) as client:
+    with httpx.Client(base_url=API_BASE_URL, timeout=10.0, headers=_AUTH_HEADERS) as client:
         print("  stopping postgres...")
         _compose("stop", "postgres")
 
@@ -298,7 +306,7 @@ def redis_outage() -> None:
     and docs/chaos-testing.md).
     """
     print("=== Scenario: Redis outage ===")
-    with httpx.Client(base_url=API_BASE_URL, timeout=10.0) as client:
+    with httpx.Client(base_url=API_BASE_URL, timeout=10.0, headers=_AUTH_HEADERS) as client:
         print("  stopping redis...")
         _compose("stop", "redis")
 

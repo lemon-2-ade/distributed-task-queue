@@ -32,6 +32,12 @@ script reports are only honest when gathered against the real thing.
 
 ## Commands
 
+Phase 23 added API key authentication to `/tasks` (see
+`docs/security.md`); this script reads `API_KEY` from the environment
+(the same variable the stack's own `.env` sets) and sends it as
+`X-API-Key` on every request, so both commands below keep working
+unmodified against a stack with auth enabled.
+
 ### `run` -- sustained-rate load
 
 ```

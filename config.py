@@ -50,6 +50,15 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     api_key: str = "change-me"
+    # Phase 23: rejects a request body larger than this before it's
+    # read into memory at all (services/api/middleware.py) -- the
+    # same "reject loudly, early, before paying any further cost"
+    # admission-control stance rate_limit/backpressure already take
+    # on POST /tasks, just guarding against an oversized body instead
+    # of overall volume. 1 MiB comfortably fits any real task payload
+    # this project's own task_handlers use; a legitimate use case
+    # needing more can raise this.
+    max_request_body_bytes: int = 1 * 1024 * 1024
 
     # ---- Worker ----
     worker_concurrency: int = 10

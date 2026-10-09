@@ -61,11 +61,12 @@ span by hand for every route.
 """
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from prometheus_client import make_asgi_app
 
@@ -76,12 +77,16 @@ from coordination.rate_limiter import RateLimiter
 from coordination.worker_registry import WorkerRegistry
 from messaging.connection import RabbitMQConnection
 from observability.tracing import setup_tracing
+from services.api.auth import require_api_key
+from services.api.middleware import MaxBodySizeMiddleware
 from services.api.metrics import (
     http_request_duration_seconds,
     http_requests_total,
     poll_external_gauges,
 )
 from services.api.routers import health, tasks, workers
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -128,6 +133,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def create_app() -> FastAPI:
     settings = get_settings()
 
+    # Phase 23: the one check this phase adds that isn't a FastAPI
+    # dependency -- a loud, process-startup warning (not a hard
+    # failure; see docs/security.md for why this stays a warning
+    # rather than refusing to start) when a non-development
+    # environment is still running the placeholder key from
+    # .env.example, which is as good as no authentication at all
+    # since anyone can read that file on GitHub.
+    if settings.environment != "development" and settings.api_key == "change-me":
+        logger.warning(
+            "API_KEY is still the default placeholder value in a %r environment -- "
+            "every request to /tasks and /workers is effectively unauthenticated. "
+            "Set a real secret via the API_KEY environment variable.",
+            settings.environment,
+        )
+
     setup_tracing(
         "api",
         otel_exporter_otlp_endpoint=settings.otel_exporter_otlp_endpoint,
@@ -172,6 +192,16 @@ def create_app() -> FastAPI:
         http_request_duration_seconds.labels(method=request.method, path=path).observe(duration)
         return response
 
+    # Phase 23: Starlette builds its middleware stack in
+    # reverse-of-registration order (the *last* middleware
+    # registered ends up *outermost*, wrapping every middleware
+    # registered before it) -- registering this after
+    # _record_http_metrics above, rather than before, is what makes
+    # the body-size guard the outermost thing an oversized request
+    # hits, ahead of the metrics middleware and FastAPIInstrumentor,
+    # instead of (uselessly) behind them.
+    app.add_middleware(MaxBodySizeMiddleware, max_body_bytes=settings.max_request_body_bytes)
+
     # Mounted, not a route: prometheus_client's generate_latest()
     # output isn't a Pydantic model FastAPI would know how to
     # serialize, and this ASGI app already handles content-type and
@@ -180,8 +210,12 @@ def create_app() -> FastAPI:
     app.mount("/metrics", make_asgi_app())
 
     app.include_router(health.router)
-    app.include_router(tasks.router)
-    app.include_router(workers.router)
+    # Phase 23: /tasks and /workers require a valid X-API-Key header
+    # (services/api/auth.py); /health, /ready, and the mounted
+    # /metrics app above stay open -- see auth.py's module docstring
+    # for why.
+    app.include_router(tasks.router, dependencies=[Depends(require_api_key)])
+    app.include_router(workers.router, dependencies=[Depends(require_api_key)])
 
     return app
 

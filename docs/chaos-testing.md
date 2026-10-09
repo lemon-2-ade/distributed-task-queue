@@ -31,6 +31,14 @@ python scripts/chaos_test.py redis-outage
 python scripts/chaos_test.py run-all
 ```
 
+Phase 23 added API key authentication to `/tasks` (see
+`docs/security.md`); this script reads `API_KEY` from the environment
+(the same variable the stack's own `.env` sets) and sends it as
+`X-API-Key` on every request, so it keeps working unmodified against
+a stack with auth enabled -- just run it with that variable in its
+environment (or leave it unset to use `.env.example`'s own
+"change-me" placeholder against a stack still using the default).
+
 **`worker-crash`** -- submits a `sleep` task, waits for it to reach
 `RUNNING`, then `SIGKILL`s the worker process mid-execution and
 confirms the task still eventually completes. This is the most

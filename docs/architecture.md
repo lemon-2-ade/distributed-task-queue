@@ -74,6 +74,18 @@ validates that the rate limiter and backpressure admission control
 (`docs/rate-limiting-and-backpressure.md`) behave as designed under
 real concurrency, not just in a unit test. See `docs/load-testing.md`.
 
+## Security hardening
+
+Phase 23 closes three concrete gaps rather than adding a new
+component: `/tasks` and `/workers` now require an `X-API-Key` header
+(`services/api/auth.py` -- a setting that existed since Phase 2 but
+was never enforced), `POST /tasks` rejects an oversized request body
+before it's read into memory (`services/api/middleware.py`), and
+every service container now runs as a dedicated non-root user
+instead of root. See `docs/security.md`, including what's
+deliberately still out of scope (TLS termination, per-client rate
+limiting, CORS, dependency scanning) and why.
+
 ## Status
 
 This document will grow section by section as each phase is implemented.

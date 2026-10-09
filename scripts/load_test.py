@@ -27,11 +27,17 @@ running):
     python scripts/load_test.py run --rate 20 --duration 30
     python scripts/load_test.py rate-limit-probe
 
+Reads API_KEY from the environment (same variable the stack's own
+.env sets -- see docs/security.md) to send as the X-API-Key header
+Phase 23 now requires on /tasks; defaults to .env.example's
+"change-me" placeholder if unset.
+
 See docs/load-testing.md for how to read the results and what each
 scenario is actually checking.
 """
 
 import asyncio
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -40,6 +46,15 @@ import httpx
 import typer
 
 API_BASE_URL = "http://localhost:8000"
+# Phase 23 requires an X-API-Key header on /tasks and /workers (see
+# services/api/auth.py) -- this script is meant to be run against
+# the same docker-compose stack whose .env sets API_KEY, so it reads
+# the same environment variable rather than taking a separate flag
+# for what's really one shared piece of config. The "change-me"
+# fallback matches .env.example's own default for a stack that
+# hasn't overridden it.
+API_KEY = os.environ.get("API_KEY", "change-me")
+_AUTH_HEADERS = {"X-API-Key": API_KEY}
 
 app = typer.Typer(help="Load-testing scenarios against a live docker-compose stack.")
 
@@ -137,7 +152,7 @@ async def _generate_load(
             outcomes.append(outcome)
 
     run_started = time.perf_counter()
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0, headers=_AUTH_HEADERS) as client:
         next_fire = run_started
         while time.perf_counter() - run_started < duration_seconds:
             tasks.append(asyncio.ensure_future(_bounded_submit(client)))
@@ -175,7 +190,7 @@ async def _poll_completion_latencies(
 
     latencies = []
     failures = 0
-    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=10.0) as client:
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=10.0, headers=_AUTH_HEADERS) as client:
         for task_id in task_ids:
             deadline = time.monotonic() + timeout_per_task
             final = None
@@ -286,7 +301,7 @@ def rate_limit_probe(
     print(f"=== Rate limit probe: {burst} requests, no pacing ===")
 
     async def _burst() -> list[RequestOutcome]:
-        async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+        async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0, headers=_AUTH_HEADERS) as client:
             tasks = [
                 asyncio.ensure_future(_submit_one(client, task_type="echo", payload={}))
                 for _ in range(burst)
@@ -311,7 +326,7 @@ def rate_limit_probe(
     time.sleep(2)
 
     async def _retry_once() -> RequestOutcome:
-        async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0) as client:
+        async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=30.0, headers=_AUTH_HEADERS) as client:
             return await _submit_one(client, task_type="echo", payload={})
 
     final = asyncio.run(_retry_once())

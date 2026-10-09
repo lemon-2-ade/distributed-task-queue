@@ -26,4 +26,14 @@ COPY services/__init__.py ./services/__init__.py
 
 RUN pip install --no-cache-dir .
 
+# Phase 23: run as a dedicated non-root user rather than the
+# container default (root) -- see docs/security.md for the full
+# reasoning. --no-create-home/--shell nologin because this user only
+# ever needs to own and run these files, never log in or have a home
+# directory of its own.
+RUN groupadd --system dtq \
+    && useradd --system --gid dtq --no-create-home --shell /usr/sbin/nologin dtq \
+    && chown -R dtq:dtq /app
+USER dtq
+
 CMD ["python", "-m", "services.scheduler.main"]
