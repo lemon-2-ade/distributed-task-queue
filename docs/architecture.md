@@ -88,6 +88,11 @@ limiting, CORS, dependency scanning) and why.
 
 ## Status
 
-This document will grow section by section as each phase is implemented.
-Phase 1 only establishes the repository shape and toolchain described
-here — no messaging, persistence, or worker code exists yet.
+All 24 phases are complete. This document grew section by section as
+each phase landed -- the dated structure above (Resilience
+verification, Security hardening, ...) reflects the order things were
+actually built in, not a reorganized final outline, so it doubles as
+a rough timeline of the project alongside being a reference. See the
+top-level [README.md](../README.md) for a summary of what's here and
+how to run it, and every other file in this `docs/` directory for one
+phase's full design rationale each.
